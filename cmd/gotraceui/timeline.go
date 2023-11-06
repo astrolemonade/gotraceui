@@ -418,7 +418,16 @@ func (tl *Timeline) notifyHidden(cv *Canvas) {
 	tl.widget = nil
 }
 
-func (tl *Timeline) Layout(win *theme.Window, gtx layout.Context, cv *Canvas, forceLabel bool, compact bool, topBorder bool, trackSpanLabels *[]string) layout.Dimensions {
+func (tl *Timeline) Layout(
+	win *theme.Window,
+	gtx layout.Context,
+	cv *Canvas,
+	forceLabel bool,
+	compact bool,
+	topBorder bool,
+	expandTinySpans bool,
+	trackSpanLabels *[]string,
+) layout.Dimensions {
 	defer rtrace.StartRegion(context.Background(), "main.TimelineWidget.Layout").End()
 
 	if tl.widget == nil {
@@ -496,7 +505,7 @@ func (tl *Timeline) Layout(win *theme.Window, gtx layout.Context, cv *Canvas, fo
 		if track.kind == TrackKindStack && !tl.cv.timeline.displayStackTracks {
 			continue
 		}
-		dims := track.Layout(win, gtx, tl, cv.timeline.filter, cv.timeline.automaticFilter, trackSpanLabels)
+		dims := track.Layout(win, gtx, tl, cv.timeline.filter, cv.timeline.automaticFilter, expandTinySpans, trackSpanLabels)
 		op.Offset(image.Pt(0, dims.Size.Y+timelineTrackGap)).Add(gtx.Ops)
 		if spans := track.widget.HoveredSpans(); spans.Len() != 0 {
 			tl.widget.hoveredSpans = spans
@@ -554,6 +563,8 @@ type renderedSpansIterator struct {
 	cv      *Canvas
 	spans   Items[ptrace.Span]
 	prevEnd trace.Timestamp
+
+	expandTinySpans bool
 }
 
 func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace.Span], startPx, endPx float32, ok bool) {
@@ -564,7 +575,14 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 	spans := it.spans
 
 	nsPerPx := float32(it.cv.nsPerPx)
-	minSpanWidthD := time.Duration(math.Ceil(float64(gtx.Dp(minSpanWidthDp)) * float64(nsPerPx)))
+	// Merge spans smaller than minSpanWidthD. If expandTinySpans is true, expand the merged span if it's still too
+	// small.
+	var minSpanWidthD time.Duration
+	if it.expandTinySpans {
+		minSpanWidthD = time.Duration(math.Ceil(float64(gtx.Dp(minSpanWidthDp)) * float64(nsPerPx)))
+	} else {
+		minSpanWidthD = time.Duration(math.Ceil(float64(gtx.Dp(2*spanBorderWidthDp)) * float64(nsPerPx)))
+	}
 	startOffset := offset
 	cvStart := it.cv.start
 
@@ -585,7 +603,7 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 		// previously merged spans becoming visible again when zooming out.
 		for offset < spans.Len() {
 			adjustedEnd := end
-			if time.Duration(end-start) < minSpanWidthD {
+			if it.expandTinySpans && time.Duration(end-start) < minSpanWidthD {
 				adjustedEnd = start + trace.Timestamp(minSpanWidthD)
 			}
 
@@ -629,7 +647,7 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 		}
 	}
 
-	if time.Duration(end-start) < minSpanWidthD {
+	if it.expandTinySpans && time.Duration(end-start) < minSpanWidthD {
 		// We're still too small, so extend the span to its minimum size.
 		end = start + trace.Timestamp(minSpanWidthD)
 	}
@@ -641,7 +659,15 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 	return it.spans.Slice(startOffset, offset), startPx, endPx, true
 }
 
-func (track *Track) Layout(win *theme.Window, gtx layout.Context, tl *Timeline, filter Filter, automaticFilter Filter, labelsOut *[]string) (dims layout.Dimensions) {
+func (track *Track) Layout(
+	win *theme.Window,
+	gtx layout.Context,
+	tl *Timeline,
+	filter Filter,
+	automaticFilter Filter,
+	expandTinySpans bool,
+	labelsOut *[]string,
+) (dims layout.Dimensions) {
 	defer rtrace.StartRegion(context.Background(), "main.TimelineWidgetTrack.Layout").End()
 
 	cv := tl.cv
@@ -841,17 +867,19 @@ func (track *Track) Layout(win *theme.Window, gtx layout.Context, tl *Timeline, 
 		}
 		maxP.Y -= float32(borderWidth)
 
-		pathID := cs[0]
-		if cs[1] != 0 {
-			pathID += colorStateLast
-		}
-		p := &paths[pathID]
+		if maxP.X-minP.X > 0 {
+			pathID := cs[0]
+			if cs[1] != 0 {
+				pathID += colorStateLast
+			}
+			p := &paths[pathID]
 
-		p.MoveTo(minP)
-		p.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
-		p.LineTo(maxP)
-		p.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
-		p.Close()
+			p.MoveTo(minP)
+			p.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
+			p.LineTo(maxP)
+			p.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
+			p.Close()
+		}
 
 		var spanTooltipState SpanTooltipState
 		spanTooltipState.events = NoItems[ptrace.EventID]{}
@@ -994,8 +1022,9 @@ func (track *Track) Layout(win *theme.Window, gtx layout.Context, tl *Timeline, 
 	} else {
 		allDspSpans := track.widget.prevFrame.dspSpans[:0]
 		it := renderedSpansIterator{
-			cv:    cv,
-			spans: cv.visibleSpans(spans),
+			cv:              cv,
+			spans:           cv.visibleSpans(spans),
+			expandTinySpans: expandTinySpans,
 		}
 		for {
 			dspSpans, startPx, endPx, ok := it.next(gtx)
