@@ -12,20 +12,16 @@ import (
 	"honnef.co/go/gotraceui/trace/ptrace"
 )
 
-func machineTrack0SpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
-	if spans.Len() != 1 {
-		return out
-	}
-	s := spans.At(0)
-	switch s.State {
+func machineTrack0SpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
+	switch span.State {
 	case ptrace.StateRunningP:
-		p := tr.P(tr.Event(s.Event).P)
+		p := tr.P(tr.Event(span.Event).P)
 		labels := tr.processorSpanLabels(p)
 		return append(out, labels...)
 	case ptrace.StateBlockedSyscall:
 		return append(out, "syscall")
 	default:
-		panic(fmt.Sprintf("unexpected state %d", s.State))
+		panic(fmt.Sprintf("unexpected state %d", span.State))
 	}
 }
 
@@ -75,42 +71,20 @@ func machineTrack0SpanContextMenu(spans Items[ptrace.Span], cv *Canvas) []*theme
 	return items
 }
 
-func machineTrack1SpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
-	if spans.Len() != 1 {
-		return out
-	}
-	g := tr.G(tr.Event(spans.At(0).Event).G)
+func machineTrack1SpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
+	g := tr.G(tr.Event(span.Event).G)
 	labels := tr.goroutineSpanLabels(g)
 	return append(out, labels...)
 }
 
-func machineTrack1SpanColor(spans Items[ptrace.Span], tr *Trace) [2]colorIndex {
-	// OPT(dh): implement caching
-	do := func(s ptrace.Span, tr *Trace) colorIndex {
-		gid := tr.Events[s.Event].G
-		g := tr.G(gid)
-		switch fn := g.Function.Fn; fn {
-		case "runtime.bgscavenge", "runtime.bgsweep", "runtime.gcBgMarkWorker":
-			return colorStateGC
-		default:
-			return stateColors[s.State]
-		}
-	}
-
-	if spans.Len() == 1 {
-		return [2]colorIndex{do(spans.At(0), tr), 0}
-	} else {
-		c := do(spans.At(0), tr)
-		for i := 1; i < spans.Len(); i++ {
-			s := spans.At(i)
-			// OPT(dh): this can get very expensive; imagine a merged span with millions of spans, all
-			// with the same color.
-			cc := do(s, tr)
-			if cc != c {
-				return [2]colorIndex{colorStateMerged, 0}
-			}
-		}
-		return [2]colorIndex{c, colorStateMerged}
+func machineTrack1SpanColor(span ptrace.Span, tr *Trace) colorIndex {
+	gid := tr.Events[span.Event].G
+	g := tr.G(gid)
+	switch fn := g.Function.Fn; fn {
+	case "runtime.bgscavenge", "runtime.bgsweep", "runtime.gcBgMarkWorker":
+		return colorStateGC
+	default:
+		return stateColors[span.State]
 	}
 }
 

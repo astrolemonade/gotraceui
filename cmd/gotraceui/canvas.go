@@ -164,8 +164,7 @@ type Canvas struct {
 		// Should tooltips be shown?
 		showTooltips showTooltips
 		// Should GC overlays be shown?
-		showGCOverlays  showGCOverlays
-		expandTinySpans bool
+		showGCOverlays showGCOverlays
 
 		hoveredTimeline *Timeline
 		hoveredSpans    Items[ptrace.Span]
@@ -189,7 +188,6 @@ type Canvas struct {
 		width              int
 		filter             Filter
 		automaticFilter    Filter
-		expandTinySpans    bool
 	}
 
 	// timelineEnds[i] describes the absolute Y pixel offset where timeline i ends. It is computed by
@@ -338,8 +336,7 @@ func (cv *Canvas) unchanged(gtx layout.Context) bool {
 		cv.prevFrame.displayStackTracks == cv.timeline.displayStackTracks &&
 		cv.prevFrame.filter == cv.timeline.filter &&
 		cv.prevFrame.automaticFilter == cv.timeline.automaticFilter &&
-		cv.prevFrame.metric == gtx.Metric &&
-		cv.prevFrame.expandTinySpans == cv.timeline.expandTinySpans
+		cv.prevFrame.metric == gtx.Metric
 }
 
 func (cv *Canvas) startZoomSelection(pos f32.Point) {
@@ -685,9 +682,6 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 
 		case theme.Shortcut{Name: "X"}:
 			cv.ToggleTimelineLabels()
-
-		case theme.Shortcut{Name: "E"}:
-			cv.timeline.expandTinySpans = !cv.timeline.expandTinySpans
 
 		case theme.Shortcut{Name: "C"}:
 			cv.ToggleCompactDisplay()
@@ -1037,7 +1031,6 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 	cv.prevFrame.filter = cv.timeline.filter
 	cv.prevFrame.automaticFilter = cv.timeline.automaticFilter
 	cv.prevFrame.metric = gtx.Metric
-	cv.prevFrame.expandTinySpans = cv.timeline.expandTinySpans
 
 	cv.clickedSpans = cv.clickedSpans[:0]
 	cv.timeline.hoveredSpans = NoItems[ptrace.Span]{}
@@ -1130,7 +1123,7 @@ func (cv *Canvas) layoutTimelines(win *theme.Window, gtx layout.Context) (layout
 		tl := cv.timelines[i]
 		stack := op.Offset(image.Pt(0, y)).Push(gtx.Ops)
 		topBorder := i > 0 && cv.timelines[i-1].widget.Hovered()
-		tl.Layout(win, gtx, cv, cv.timeline.displayAllLabels, cv.timeline.compact, topBorder, cv.timeline.expandTinySpans, &cv.trackSpanLabels)
+		tl.Layout(win, gtx, cv, cv.timeline.displayAllLabels, cv.timeline.compact, topBorder, &cv.trackSpanLabels)
 		stack.Pop()
 
 		y += tl.Height(gtx, cv)

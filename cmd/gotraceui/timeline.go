@@ -11,7 +11,6 @@ import (
 	"unsafe"
 
 	"honnef.co/go/gotraceui/clip"
-	"honnef.co/go/gotraceui/container"
 	"honnef.co/go/gotraceui/gesture"
 	"honnef.co/go/gotraceui/layout"
 	"honnef.co/go/gotraceui/mem"
@@ -62,11 +61,6 @@ type Timeline struct {
 	displayed bool
 	cv        *Canvas
 
-	// This cache is stored per timeline, not per timeline widget, because 1) only processors use it 2) it's expensive
-	// to populate. There aren't enough processors or items in the cache to worry about its permanent memory usage, but
-	// we definitely care about the poor performance of the first few frames rendered with an unpopulated cache.
-	spanColorCache *container.IntervalTree[trace.Timestamp, [2]colorIndex]
-
 	widget *TimelineWidget
 }
 
@@ -101,6 +95,8 @@ type SpanTooltipState struct {
 }
 
 type Track struct {
+	rnd Renderer
+
 	parent           *Timeline
 	kind             TrackKind
 	spans            *theme.Future[Items[ptrace.Span]]
@@ -112,8 +108,8 @@ type Track struct {
 	End   trace.Timestamp
 	Len   int
 
-	spanLabel       func(spans Items[ptrace.Span], tr *Trace, out []string) []string
-	spanColor       func(spans Items[ptrace.Span], tr *Trace) [2]colorIndex
+	spanLabel       func(span ptrace.Span, tr *Trace, out []string) []string
+	spanColor       func(span ptrace.Span, tr *Trace) colorIndex
 	spanTooltip     func(win *theme.Window, gtx layout.Context, tr *Trace, state SpanTooltipState) layout.Dimensions
 	spanContextMenu func(spans Items[ptrace.Span], cv *Canvas) []*theme.MenuItem
 
@@ -425,7 +421,6 @@ func (tl *Timeline) Layout(
 	forceLabel bool,
 	compact bool,
 	topBorder bool,
-	expandTinySpans bool,
 	trackSpanLabels *[]string,
 ) layout.Dimensions {
 	defer rtrace.StartRegion(context.Background(), "main.TimelineWidget.Layout").End()
@@ -505,7 +500,7 @@ func (tl *Timeline) Layout(
 		if track.kind == TrackKindStack && !tl.cv.timeline.displayStackTracks {
 			continue
 		}
-		dims := track.Layout(win, gtx, tl, cv.timeline.filter, cv.timeline.automaticFilter, expandTinySpans, trackSpanLabels)
+		dims := track.Layout(win, gtx, tl, cv.timeline.filter, cv.timeline.automaticFilter, trackSpanLabels)
 		op.Offset(image.Pt(0, dims.Size.Y+timelineTrackGap)).Add(gtx.Ops)
 		if spans := track.widget.HoveredSpans(); spans.Len() != 0 {
 			tl.widget.hoveredSpans = spans
@@ -539,32 +534,14 @@ func (tl *Timeline) Layout(
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, timelineHeight)}
 }
 
-func defaultSpanColor(spans Items[ptrace.Span]) [2]colorIndex {
-	if spans.Len() == 1 {
-		return [2]colorIndex{stateColors[spans.At(0).State], 0}
-	} else {
-		// OPT(dh): this would benefit from iterators, for span selectors backed by data that isn't already made of
-		// ptrace.Span
-		spans := spans
-		c := stateColors[spans.At(0).State]
-		for i := 1; i < spans.Len(); i++ {
-			s := spans.At(i)
-			cc := stateColors[s.State]
-			if cc != c {
-				return [2]colorIndex{colorStateMerged, 0}
-			}
-		}
-		return [2]colorIndex{c, colorStateMerged}
-	}
+func defaultSpanColor(span ptrace.Span, tr *Trace) colorIndex {
+	return stateColors[span.State]
 }
 
 type renderedSpansIterator struct {
-	offset  int
-	cv      *Canvas
-	spans   Items[ptrace.Span]
-	prevEnd trace.Timestamp
-
-	expandTinySpans bool
+	offset int
+	cv     *Canvas
+	spans  Items[ptrace.Span]
 }
 
 func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace.Span], startPx, endPx float32, ok bool) {
@@ -575,14 +552,8 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 	spans := it.spans
 
 	nsPerPx := float32(it.cv.nsPerPx)
-	// Merge spans smaller than minSpanWidthD. If expandTinySpans is true, expand the merged span if it's still too
-	// small.
-	var minSpanWidthD time.Duration
-	if it.expandTinySpans {
-		minSpanWidthD = time.Duration(math.Ceil(float64(gtx.Dp(minSpanWidthDp)) * float64(nsPerPx)))
-	} else {
-		minSpanWidthD = time.Duration(math.Ceil(float64(gtx.Dp(2*spanBorderWidthDp)) * float64(nsPerPx)))
-	}
+	// Merge spans smaller than minSpanWidthD.
+	minSpanWidthD := time.Duration(math.Ceil(float64(gtx.Dp(minSpanWidthDp)) * it.cv.nsPerPx))
 	startOffset := offset
 	cvStart := it.cv.start
 
@@ -591,10 +562,6 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 
 	start := s.Start
 	end := s.End
-	if it.prevEnd > start {
-		// The previous span was extended and grew into this span. This shifts our start position to the right.
-		start = it.prevEnd
-	}
 
 	if time.Duration(end-start) < minSpanWidthD && s.State != ptrace.StateDone {
 		// Merge all tiny spans until we find a span or gap that's big enough to stand on its own. We do not stop
@@ -603,9 +570,6 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 		// previously merged spans becoming visible again when zooming out.
 		for offset < spans.Len() {
 			adjustedEnd := end
-			if it.expandTinySpans && time.Duration(end-start) < minSpanWidthD {
-				adjustedEnd = start + trace.Timestamp(minSpanWidthD)
-			}
 
 			// For a span to be large enough to stand on its own, it has to end at least minSpanWidthD later than the
 			// current span. Use binary search to find that span. This also finds gaps, because for a gap to be big
@@ -647,17 +611,13 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 		}
 	}
 
-	if it.expandTinySpans && time.Duration(end-start) < minSpanWidthD {
-		// We're still too small, so extend the span to its minimum size.
-		end = start + trace.Timestamp(minSpanWidthD)
-	}
-
 	it.offset = offset
-	it.prevEnd = end
 	startPx = float32(start-cvStart) / nsPerPx
 	endPx = float32(end-cvStart) / nsPerPx
 	return it.spans.Slice(startOffset, offset), startPx, endPx, true
 }
+
+var debugNewTexture = false
 
 func (track *Track) Layout(
 	win *theme.Window,
@@ -665,7 +625,6 @@ func (track *Track) Layout(
 	tl *Timeline,
 	filter Filter,
 	automaticFilter Filter,
-	expandTinySpans bool,
 	labelsOut *[]string,
 ) (dims layout.Dimensions) {
 	defer rtrace.StartRegion(context.Background(), "main.TimelineWidgetTrack.Layout").End()
@@ -758,10 +717,10 @@ func (track *Track) Layout(
 	for i := range track.widget.ops {
 		track.widget.ops[i].Reset()
 	}
-	// one path per single-color span and one path per merged+color gradient
+	// one path per single-color span
 	//
 	//gcassert:noescape
-	paths := [colorStateLast * 2]clip.Path{}
+	paths := [colorStateLast]clip.Path{}
 
 	var outlinesPath clip.Path
 	var highlightedPrimaryOutlinesPath clip.Path
@@ -805,15 +764,13 @@ func (track *Track) Layout(
 			}
 		}
 
-		var cs [2]colorIndex
-		if track.spanColor != nil {
-			cs = track.spanColor(dspSpans, tr)
-		} else {
-			cs = defaultSpanColor(dspSpans)
-		}
-
-		if cs[1] != 0 && cs[1] != colorStateMerged {
-			panic(fmt.Sprintf("two-color spans are only supported with color₁ == colorStateMerged, got %v", cs))
+		var cs colorIndex
+		if dspSpans.Len() == 1 {
+			if track.spanColor != nil {
+				cs = track.spanColor(dspSpans.At(0), tr)
+			} else {
+				cs = defaultSpanColor(dspSpans.At(0), tr)
+			}
 		}
 
 		var minP f32.Point
@@ -821,8 +778,11 @@ func (track *Track) Layout(
 		minP = f32.Pt(max(startPx, 0), 0)
 		maxP = f32.Pt(min(endPx, float32(gtx.Constraints.Max.X)), float32(trackHeight))
 
-		highlighted := filter.Match(dspSpans, ItemContainer{Timeline: tl, Track: track}) || automaticFilter.Match(dspSpans, ItemContainer{Timeline: tl, Track: track})
+		// highlighted := filter.Match(dspSpans, ItemContainer{Timeline: tl, Track: track}) || automaticFilter.Match(dspSpans, ItemContainer{Timeline: tl, Track: track})
+		highlighted := false
 		if hovered {
+			// XXX if hovering a "merged" span then we can't just draw a rectangle for the highlight, because no span
+			// will be drawn on top of the border.
 			highlightedPrimaryOutlinesPath.MoveTo(minP)
 			highlightedPrimaryOutlinesPath.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
 			highlightedPrimaryOutlinesPath.LineTo(maxP)
@@ -835,11 +795,8 @@ func (track *Track) Layout(
 			highlightedSecondaryOutlinesPath.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
 			highlightedSecondaryOutlinesPath.Close()
 		} else {
-			if dspSpans.At(0).State != statePlaceholder {
+			if dspSpans.Len() == 1 && dspSpans.At(0).State != statePlaceholder && (endPx-startPx) > float32(gtx.Dp(minSpanWidthDp)) {
 				// Draw outline as a rectangle, the span will draw on top of it so that only the outline remains.
-				//
-				// OPT(dh): for timelines that have no gaps between any of the spans this can be drawn as a single rectangle
-				// covering all spans.
 				outlinesPath.MoveTo(minP)
 				outlinesPath.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
 				outlinesPath.LineTo(maxP)
@@ -848,171 +805,189 @@ func (track *Track) Layout(
 			}
 		}
 
-		borderWidth := spanBorderWidth
-		if hovered || highlighted {
-			borderWidth = spanHighlightedBorderWidth
-		}
-		if first && startPx < 0 {
-			// Never draw a left border for truncated spans
-		} else if !first && startPx == prevEndPx && !(highlighted || hovered) {
-			// Don't draw left border if it'd touch a right border, unless the span is highlighted
-		} else {
-			minP.X += float32(borderWidth)
-		}
-		prevEndPx = endPx
-
-		minP.Y += float32(borderWidth)
-		if endPx <= float32(gtx.Constraints.Max.X) {
-			maxP.X -= float32(borderWidth)
-		}
-		maxP.Y -= float32(borderWidth)
-
-		if maxP.X-minP.X > 0 {
-			pathID := cs[0]
-			if cs[1] != 0 {
-				pathID += colorStateLast
+		if dspSpans.Len() == 1 && (endPx-startPx) > float32(gtx.Dp(minSpanWidthDp)) {
+			borderWidth := spanBorderWidth
+			if hovered || highlighted {
+				borderWidth = spanHighlightedBorderWidth
 			}
-			p := &paths[pathID]
-
-			p.MoveTo(minP)
-			p.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
-			p.LineTo(maxP)
-			p.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
-			p.Close()
-		}
-
-		var spanTooltipState SpanTooltipState
-		spanTooltipState.events = NoItems[ptrace.EventID]{}
-		spanTooltipState.eventsUnderCursor = NoItems[ptrace.EventID]{}
-		if cv.timeline.showTooltips < showTooltipsNone && hovered {
-			spanTooltipState.spans = dspSpans
-			if !track.hideEventMarkers {
-				spanTooltipState.events = Events(dspSpans, tr)
+			if first && startPx < 0 {
+				// Never draw a left border for truncated spans
+			} else if !first && startPx == prevEndPx && !(highlighted || hovered) {
+				// Don't draw left border if it'd touch a right border, unless the span is highlighted
+			} else {
+				minP.X += float32(borderWidth)
 			}
-		}
+			prevEndPx = endPx
 
-		dotRadiusX := float32(gtx.Dp(4))
-		dotRadiusY := float32(gtx.Dp(3))
-		if !track.hideEventMarkers && maxP.X-minP.X > dotRadiusX*2 && dspSpans.Len() == 1 {
-			// We only display event dots in unmerged spans because merged spans can split into smaller spans when we
-			// zoom in, causing dots to disappear and reappearappear and disappear.
-			events := Events(dspSpans.Slice(0, 1), tr)
+			minP.Y += float32(borderWidth)
+			if endPx <= float32(gtx.Constraints.Max.X) {
+				maxP.X -= float32(borderWidth)
+			}
+			maxP.Y -= float32(borderWidth)
 
-			dotGap := float32(gtx.Dp(4))
-			centerY := float32(trackHeight) / 2
+			if maxP.X-minP.X > 0 {
+				p := &paths[cs]
 
-			for i := 0; i < events.Len(); i++ {
-				ev := events.At(i)
-				px := cv.tsToPx(tr.Event(ev).Ts)
+				p.MoveTo(minP)
+				p.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
+				p.LineTo(maxP)
+				p.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
+				p.Close()
+			}
 
-				if px+dotRadiusX < minP.X {
-					continue
+			var spanTooltipState SpanTooltipState
+			spanTooltipState.events = NoItems[ptrace.EventID]{}
+			spanTooltipState.eventsUnderCursor = NoItems[ptrace.EventID]{}
+			if cv.timeline.showTooltips < showTooltipsNone && hovered {
+				spanTooltipState.spans = dspSpans
+				if !track.hideEventMarkers {
+					spanTooltipState.events = Events(dspSpans, tr)
 				}
-				if px-dotRadiusX > maxP.X {
-					break
-				}
+			}
 
-				start := px
-				end := px
-				oldi := i
-				for i = i + 1; i < events.Len(); i++ {
+			dotRadiusX := float32(gtx.Dp(4))
+			dotRadiusY := float32(gtx.Dp(3))
+			if !track.hideEventMarkers && maxP.X-minP.X > dotRadiusX*2 {
+				// We only display event dots in unmerged spans because merged spans can split into smaller spans when we
+				// zoom in, causing dots to disappear and reappearappear and disappear.
+				events := Events(dspSpans.Slice(0, 1), tr)
+
+				dotGap := float32(gtx.Dp(4))
+				centerY := float32(trackHeight) / 2
+
+				for i := 0; i < events.Len(); i++ {
 					ev := events.At(i)
 					px := cv.tsToPx(tr.Event(ev).Ts)
-					if px < end+dotRadiusX*2+dotGap {
-						end = px
-					} else {
+
+					if px+dotRadiusX < minP.X {
+						continue
+					}
+					if px-dotRadiusX > maxP.X {
+						break
+					}
+
+					start := px
+					end := px
+					oldi := i
+					for i = i + 1; i < events.Len(); i++ {
+						ev := events.At(i)
+						px := cv.tsToPx(tr.Event(ev).Ts)
+						if px < end+dotRadiusX*2+dotGap {
+							end = px
+						} else {
+							break
+						}
+					}
+					i--
+
+					if minP.X != 0 && start-dotRadiusX < minP.X {
+						start = minP.X + dotRadiusX
+					}
+					if maxP.X != float32(gtx.Constraints.Max.X) && end+dotRadiusX > maxP.X {
+						end = maxP.X - dotRadiusX
+					}
+
+					minX := start - dotRadiusX
+					minY := centerY - dotRadiusY
+					maxX := end + dotRadiusX
+					maxY := centerY + dotRadiusY
+
+					eventsPath.MoveTo(f32.Pt(minX, minY))
+					eventsPath.LineTo(f32.Pt(maxX, minY))
+					eventsPath.LineTo(f32.Pt(maxX, maxY))
+					eventsPath.LineTo(f32.Pt(minX, maxY))
+					eventsPath.Close()
+
+					if cv.timeline.showTooltips < showTooltipsNone && track.widget.hover.Hovered() && track.widget.hover.Pointer().X >= minX && track.widget.hover.Pointer().X < maxX {
+						spanTooltipState.eventsUnderCursor = events.Slice(oldi, i+1)
+					}
+				}
+			}
+
+			if spanTooltipState.spans != nil && track.spanTooltip != nil {
+				win.SetTooltip(func(win *theme.Window, gtx layout.Context) layout.Dimensions {
+					// OPT(dh): this allocates for the closure
+					// OPT(dh): avoid allocating a new tooltip if it's the same as last frame
+					return track.spanTooltip(win, gtx, tr, spanTooltipState)
+				})
+			}
+
+			if track.spanLabel != nil && maxP.X-minP.X > float32(2*minSpanWidth) && dspSpans.Len() == 1 {
+				// The Label callback, if set, returns a list of labels to try and use for the span. We pick the first label
+				// that fits fully in the span, as it would be drawn untruncated. That is, the ideal label size depends on
+				// the zoom level, not panning. If no label fits, we use the last label in the list. This label can be the
+				// empty string to effectively display no label.
+				//
+				// We don't try to render a label for very small spans.
+				if *labelsOut = track.spanLabel(dspSpans.At(0), tr, (*labelsOut)[:0]); len(*labelsOut) > 0 {
+					for i, label := range *labelsOut {
+						if label == "" {
+							continue
+						}
+
+						font := font.Font{Weight: font.ExtraBold}
+						n := win.TextLength(gtx, widget.Label{}, font, win.Theme.TextSize, label)
+						if float32(n) > endPx-startPx {
+							// This label doesn't fit. If the callback provided more labels, try those instead. If it is the
+							// last label, use it and let Gio truncate it, appending a truncation indicator if necessary.
+							if i < len(*labelsOut)-1 {
+								continue
+							}
+						}
+
+						var dims layout.Dimensions
+						var call op.CallOp
+						{
+							gtx := gtx
+							gtx.Ops = labelsOps
+							m := op.Record(gtx.Ops)
+							gtx.Constraints.Min = image.Point{}
+							gtx.Constraints.Max = image.Pt(int(round32(maxP.X-minP.X)), int(round32(maxP.Y-minP.Y)))
+							dims = widget.Label{MaxLines: 1, Truncator: "…", WrapPolicy: text.WrapGraphemes}.
+								Layout(gtx, win.Theme.Shaper, font, win.Theme.TextSize, label, win.ColorMaterial(gtx, win.Theme.Palette.Foreground))
+							call = m.Stop()
+						}
+						middleOfSpan := startPx + (endPx-startPx)/2
+						left := middleOfSpan - float32(dims.Size.X)/2
+						if left+float32(dims.Size.X) > maxP.X {
+							left = maxP.X - float32(dims.Size.X)
+						}
+						if left < minP.X {
+							left = minP.X
+						}
+						stack := op.Offset(image.Pt(int(left), 0)).Push(labelsOps)
+						paint.ColorOp{Color: win.ConvertColor(win.Theme.Palette.Foreground)}.Add(labelsOps)
+						stack2 := clip.FRect{Max: f32.Pt(maxP.X-minP.X, maxP.Y-minP.Y)}.Op(labelsOps).Push(labelsOps)
+						call.Add(labelsOps)
+						stack2.Pop()
+						stack.Pop()
 						break
 					}
 				}
-				i--
-
-				if minP.X != 0 && start-dotRadiusX < minP.X {
-					start = minP.X + dotRadiusX
-				}
-				if maxP.X != float32(gtx.Constraints.Max.X) && end+dotRadiusX > maxP.X {
-					end = maxP.X - dotRadiusX
-				}
-
-				minX := start - dotRadiusX
-				minY := centerY - dotRadiusY
-				maxX := end + dotRadiusX
-				maxY := centerY + dotRadiusY
-
-				eventsPath.MoveTo(f32.Pt(minX, minY))
-				eventsPath.LineTo(f32.Pt(maxX, minY))
-				eventsPath.LineTo(f32.Pt(maxX, maxY))
-				eventsPath.LineTo(f32.Pt(minX, maxY))
-				eventsPath.Close()
-
-				if cv.timeline.showTooltips < showTooltipsNone && track.widget.hover.Hovered() && track.widget.hover.Pointer().X >= minX && track.widget.hover.Pointer().X < maxX {
-					spanTooltipState.eventsUnderCursor = events.Slice(oldi, i+1)
-				}
 			}
+
+			first = false
 		}
 
-		if spanTooltipState.spans != nil && track.spanTooltip != nil {
-			win.SetTooltip(func(win *theme.Window, gtx layout.Context) layout.Dimensions {
-				// OPT(dh): this allocates for the closure
-				// OPT(dh): avoid allocating a new tooltip if it's the same as last frame
-				return track.spanTooltip(win, gtx, tr, spanTooltipState)
-			})
-		}
+	}
 
-		if track.spanLabel != nil && maxP.X-minP.X > float32(2*minSpanWidth) {
-			// The Label callback, if set, returns a list of labels to try and use for the span. We pick the first label
-			// that fits fully in the span, as it would be drawn untruncated. That is, the ideal label size depends on
-			// the zoom level, not panning. If no label fits, we use the last label in the list. This label can be the
-			// empty string to effectively display no label.
-			//
-			// We don't try to render a label for very small spans.
-			if *labelsOut = track.spanLabel(dspSpans, tr, (*labelsOut)[:0]); len(*labelsOut) > 0 {
-				for i, label := range *labelsOut {
-					if label == "" {
-						continue
-					}
-
-					font := font.Font{Weight: font.ExtraBold}
-					n := win.TextLength(gtx, widget.Label{}, font, win.Theme.TextSize, label)
-					if float32(n) > endPx-startPx {
-						// This label doesn't fit. If the callback provided more labels, try those instead. If it is the
-						// last label, use it and let Gio truncate it, appending a truncation indicator if necessary.
-						if i < len(*labelsOut)-1 {
-							continue
-						}
-					}
-
-					var dims layout.Dimensions
-					var call op.CallOp
-					{
-						gtx := gtx
-						gtx.Ops = labelsOps
-						m := op.Record(gtx.Ops)
-						gtx.Constraints.Min = image.Point{}
-						gtx.Constraints.Max = image.Pt(int(round32(maxP.X-minP.X)), int(round32(maxP.Y-minP.Y)))
-						dims = widget.Label{MaxLines: 1, Truncator: "…", WrapPolicy: text.WrapGraphemes}.
-							Layout(gtx, win.Theme.Shaper, font, win.Theme.TextSize, label, win.ColorMaterial(gtx, win.Theme.Palette.Foreground))
-						call = m.Stop()
-					}
-					middleOfSpan := startPx + (endPx-startPx)/2
-					left := middleOfSpan - float32(dims.Size.X)/2
-					if left+float32(dims.Size.X) > maxP.X {
-						left = maxP.X - float32(dims.Size.X)
-					}
-					if left < minP.X {
-						left = minP.X
-					}
-					stack := op.Offset(image.Pt(int(left), 0)).Push(labelsOps)
-					paint.ColorOp{Color: win.ConvertColor(win.Theme.Palette.Foreground)}.Add(labelsOps)
-					stack2 := clip.FRect{Max: f32.Pt(maxP.X-minP.X, maxP.Y-minP.Y)}.Op(labelsOps).Push(labelsOps)
-					call.Add(labelsOps)
-					stack2.Pop()
-					stack.Pop()
-					break
-				}
+	allDspSpans := track.widget.prevFrame.dspSpans[:0]
+	if debugNewTexture {
+		// OPT(dh): reuse slice between frames
+		var texs []DisplayTexture
+		texs = track.rnd.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs)
+		for _, tex := range texs {
+			if tex.Image == nil {
+				continue
 			}
+			func() {
+				myop := paint.NewImageOp(tex.Image)
+				myop.Add(gtx.Ops)
+				stack := op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(tex.XScale, 40)).Offset(f32.Pt(tex.XOffset, 0))).Push(gtx.Ops)
+				paint.PaintOp{}.Add(gtx.Ops)
+				stack.Pop()
+			}()
 		}
-
-		first = false
 	}
 
 	if cv.unchanged(gtx) && track.widget.prevFrame.dspSpans != nil && track.widget.prevFrame.placeholder == !haveSpans {
@@ -1020,23 +995,23 @@ func (track *Track) Layout(
 			doSpans(prevSpans.dspSpans, prevSpans.startPx, prevSpans.endPx)
 		}
 	} else {
-		allDspSpans := track.widget.prevFrame.dspSpans[:0]
 		it := renderedSpansIterator{
-			cv:              cv,
-			spans:           cv.visibleSpans(spans),
-			expandTinySpans: expandTinySpans,
+			cv:    cv,
+			spans: cv.visibleSpans(spans),
 		}
 		for {
 			dspSpans, startPx, endPx, ok := it.next(gtx)
 			if !ok {
 				break
 			}
+
 			allDspSpans = append(allDspSpans, struct {
 				dspSpans       Items[ptrace.Span]
 				startPx, endPx float32
 			}{dspSpans, startPx, endPx})
 			doSpans(dspSpans, startPx, endPx)
 		}
+
 		track.widget.prevFrame.dspSpans = allDspSpans
 	}
 
@@ -1129,22 +1104,15 @@ func (track *Track) Layout(
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, trackHeight)}
 }
 
-func singleSpanLabel(label string, showForMerged bool) func(spans Items[ptrace.Span], tr *Trace, out []string) []string {
-	return func(spans Items[ptrace.Span], tr *Trace, out []string) []string {
-		if !showForMerged && spans.Len() != 1 {
-			return out
-		}
+func singleSpanLabel(label string) func(span ptrace.Span, tr *Trace, out []string) []string {
+	return func(span ptrace.Span, tr *Trace, out []string) []string {
 		return append(out, label)
 	}
 }
 
-func singleSpanColor(c colorIndex) func(spans Items[ptrace.Span], tr *Trace) [2]colorIndex {
-	return func(spans Items[ptrace.Span], tr *Trace) [2]colorIndex {
-		if spans.Len() == 1 {
-			return [2]colorIndex{c, 0}
-		} else {
-			return [2]colorIndex{c, colorStateMerged}
-		}
+func singleSpanColor(c colorIndex) func(span ptrace.Span, tr *Trace) colorIndex {
+	return func(span ptrace.Span, tr *Trace) colorIndex {
+		return c
 	}
 }
 
@@ -1173,7 +1141,7 @@ func NewGCTimeline(cv *Canvas, trace *Trace, spans []ptrace.Span) *Timeline {
 		tl.tracks[0].Len = len(spans)
 	}
 	tl.tracks[0].spans = theme.Immediate[Items[ptrace.Span]](ss)
-	tl.tracks[0].spanLabel = singleSpanLabel("GC", true)
+	tl.tracks[0].spanLabel = singleSpanLabel("GC")
 	tl.tracks[0].spanColor = singleSpanColor(colorStateGC)
 	tl.item = &GC{ss}
 
@@ -1205,11 +1173,8 @@ func NewSTWTimeline(cv *Canvas, tr *Trace, spans []ptrace.Span) *Timeline {
 		tl.tracks[0].Len = len(spans)
 	}
 	tl.tracks[0].spans = theme.Immediate[Items[ptrace.Span]](ss)
-	tl.tracks[0].spanLabel = func(spans Items[ptrace.Span], tr *Trace, out []string) []string {
-		if spans.Len() != 1 {
-			return nil
-		}
-		kindID := tr.Events[spans.At(0).Event].Args[trace.ArgSTWStartKind]
+	tl.tracks[0].spanLabel = func(span ptrace.Span, tr *Trace, out []string) []string {
+		kindID := tr.Events[span.Event].Args[trace.ArgSTWStartKind]
 		return append(out, stwSpanLabels[tr.STWReason(kindID)])
 	}
 	tl.tracks[0].spanColor = singleSpanColor(colorStateSTW)
