@@ -411,8 +411,14 @@ func (cv *Canvas) zoom(gtx layout.Context, ticks float32, at f32.Point) {
 
 		start := cv.start + ds
 		end := cv.End() - de
-		cv.start = start
-		cv.nsPerPx = float64(end-start) / float64(cv.width)
+		if float64(end-start)/float64(cv.width) >= 1 {
+			cv.start = start
+			cv.nsPerPx = float64(end-start) / float64(cv.width)
+		} else {
+			// Instead of trying to set nsPerPx to exactly 1, do nothing. This will leave it slightly above 1, but
+			// avoids spans jerking around because of rounding issues when trying to compute a new start position.
+		}
+
 	} else if ticks > 0 {
 		// Scrolling down, out of the screen, zooming out
 		ratio := float64(at.X) / float64(gtx.Constraints.Max.X)
