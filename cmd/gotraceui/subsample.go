@@ -68,8 +68,6 @@ const (
 	debugDisplayZoom      = false
 
 	texWidth = 8192
-	// XXX a hack, to work around negative log2
-	logOffset = 10
 )
 
 type Cache[K comparable, V any] struct {
@@ -193,7 +191,7 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	start = max(start, 0)
 	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
 	end = min(end, tr.End())
-	logNsPerPx := int(math.Log2(nsPerPx) + logOffset)
+	logNsPerPx := int(math.Log2(nsPerPx))
 
 	texKey := textureKey{
 		Start:   start,
