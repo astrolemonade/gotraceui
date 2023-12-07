@@ -300,138 +300,139 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	r.textures[logNsPerPx].Insert(start, end, tex)
 	slices.Insert(out, 0, tex)
 
-	go func() {
-		first := sort.Search(spans.Len(), func(i int) bool {
-			return spans.At(i).End >= start
-		})
-		last := sort.Search(spans.Len(), func(i int) bool {
-			return spans.At(i).Start >= end
-		})
-		if last <= first {
-			img := image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
-			tex.mu.Lock()
-			defer tex.mu.Unlock()
-			tex.image = img
-			tex.op = paint.NewImageOp(img)
+	go r.computeTexture(start, end, nsPerPx, spans, tex, tr, spanColor)
+	return out
+}
+
+func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
+	first := sort.Search(spans.Len(), func(i int) bool {
+		return spans.At(i).End >= start
+	})
+	last := sort.Search(spans.Len(), func(i int) bool {
+		return spans.At(i).Start >= end
+	})
+	if last <= first {
+		img := image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
+		tex.mu.Lock()
+		defer tex.mu.Unlock()
+		tex.image = img
+		tex.op = paint.NewImageOp(img)
+		return
+	}
+
+	if debugSlowRenderer {
+		// Simulate a slow renderer.
+		time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+	}
+
+	type pixel struct {
+		sum       color.LinearSRGB
+		sumWeight float64
+	}
+
+	pixels := make([]pixel, texWidth)
+
+	addSample := func(bin int, w float64, v color.LinearSRGB) {
+		if w == 0 {
+			return
+		}
+		if bin >= len(pixels) {
+			// XXX
+			return
+		}
+		if bin < 0 {
+			// XXX
 			return
 		}
 
-		if debugSlowRenderer {
-			// Simulate a slow renderer.
-			time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+		if w == 1 {
+			pixels[bin] = pixel{
+				sum:       v,
+				sumWeight: 1,
+			}
+			return
+		}
+		px := &pixels[bin]
+		if px.sumWeight+w > 1 {
+			// Adjust for rounding errors
+			w = 1 - px.sumWeight
+		}
+		px.sum.R += v.R * float32(w)
+		px.sum.G += v.G * float32(w)
+		px.sum.B += v.B * float32(w)
+		px.sumWeight += w
+	}
+
+	for i := first; i < last; i++ {
+		span := spans.At(i)
+
+		firstBucket := float64(span.Start-start) / nsPerPx
+		lastBucket := float64(span.End-start) / nsPerPx
+
+		if firstBucket >= texWidth {
+			break
+		}
+		if lastBucket < 0 {
+			continue
 		}
 
-		type pixel struct {
-			sum       color.LinearSRGB
-			sumWeight float64
+		firstBucket = max(firstBucket, 0)
+		lastBucket = min(lastBucket, texWidth)
+
+		colorIdx := spanColor(spans.At(i), tr)
+		c, ok := r.oklchToLinear.Get(colors[colorIdx])
+		if !ok {
+			c := colors[colorIdx].MapToSRGBGamut()
+			r.oklchToLinear.Add(colors[colorIdx], c)
 		}
 
-		pixels := make([]pixel, texWidth)
+		if int(firstBucket) == int(lastBucket) {
+			// falls into a single bucket
+			w := float64(span.Duration()) / nsPerPx
+			addSample(int(firstBucket), w, c)
+		} else {
+			// falls into at least two buckets
 
-		addSample := func(bin int, w float64, v color.LinearSRGB) {
-			if w == 0 {
-				return
-			}
-			if bin >= len(pixels) {
-				// XXX
-				return
-			}
-			if bin < 0 {
-				// XXX
-				return
-			}
+			_, frac := math.Modf(firstBucket)
+			w1 := 1 - frac
+			_, frac = math.Modf(lastBucket)
+			w2 := frac
 
-			if w == 1 {
-				pixels[bin] = pixel{
-					sum:       v,
-					sumWeight: 1,
-				}
-				return
-			}
-			px := &pixels[bin]
-			if px.sumWeight+w > 1 {
-				// Adjust for rounding errors
-				w = 1 - px.sumWeight
-			}
-			px.sum.R += v.R * float32(w)
-			px.sum.G += v.G * float32(w)
-			px.sum.B += v.B * float32(w)
-			px.sumWeight += w
+			addSample(int(firstBucket), w1, c)
+			addSample(int(lastBucket), w2, c)
 		}
 
-		for i := first; i < last; i++ {
-			span := spans.At(i)
+		for i := int(firstBucket) + 1; i < int(lastBucket); i++ {
+			// All the full buckets between the first and last one
+			addSample(i, 1, c)
+		}
+	}
 
-			firstBucket := float64(span.Start-start) / nsPerPx
-			lastBucket := float64(span.End-start) / nsPerPx
-
-			if firstBucket >= texWidth {
-				break
-			}
-			if lastBucket < 0 {
-				continue
-			}
-
-			firstBucket = max(firstBucket, 0)
-			lastBucket = min(lastBucket, texWidth)
-
-			colorIdx := spanColor(spans.At(i), tr)
-			c, ok := r.oklchToLinear.Get(colors[colorIdx])
-			if !ok {
-				c := colors[colorIdx].MapToSRGBGamut()
-				r.oklchToLinear.Add(colors[colorIdx], c)
-			}
-
-			if int(firstBucket) == int(lastBucket) {
-				// falls into a single bucket
-				w := float64(span.Duration()) / nsPerPx
-				addSample(int(firstBucket), w, c)
-			} else {
-				// falls into at least two buckets
-
-				_, frac := math.Modf(firstBucket)
-				w1 := 1 - frac
-				_, frac = math.Modf(lastBucket)
-				w2 := frac
-
-				addSample(int(firstBucket), w1, c)
-				addSample(int(lastBucket), w2, c)
-			}
-
-			for i := int(firstBucket) + 1; i < int(lastBucket); i++ {
-				// All the full buckets between the first and last one
-				addSample(i, 1, c)
-			}
+	img := image.NewRGBA(image.Rect(0, 0, texWidth, 1))
+	for x := range pixels {
+		px := &pixels[x]
+		px.sum.A = 1
+		if px.sumWeight < 1 {
+			w := 1 - px.sumWeight
+			px.sum.R += float32(w)
+			px.sum.G += float32(w)
+			px.sum.B += float32((212.0 / 255.0) * w)
+			px.sumWeight = 1
 		}
 
-		img := image.NewRGBA(image.Rect(0, 0, texWidth, 1))
-		for x := range pixels {
-			px := &pixels[x]
-			px.sum.A = 1
-			if px.sumWeight < 1 {
-				w := 1 - px.sumWeight
-				px.sum.R += float32(w)
-				px.sum.G += float32(w)
-				px.sum.B += float32((212.0 / 255.0) * w)
-				px.sumWeight = 1
-			}
+		srgb := stdcolor.RGBAModel.Convert(px.sum.SRGB()).(stdcolor.RGBA)
+		i := img.PixOffset(x, 0)
+		s := img.Pix[i : i+4 : i+4] // Small cap improves performance, see https://golang.org/issue/27857
+		s[0] = srgb.R
+		s[1] = srgb.G
+		s[2] = srgb.B
+		s[3] = srgb.A
+	}
 
-			srgb := stdcolor.RGBAModel.Convert(px.sum.SRGB()).(stdcolor.RGBA)
-			i := img.PixOffset(x, 0)
-			s := img.Pix[i : i+4 : i+4] // Small cap improves performance, see https://golang.org/issue/27857
-			s[0] = srgb.R
-			s[1] = srgb.G
-			s[2] = srgb.B
-			s[3] = srgb.A
-		}
-
-		tex.mu.Lock()
-		defer tex.mu.Unlock()
-		tex.op = paint.NewImageOp(img)
-		tex.image = img
-	}()
-
-	return out
+	tex.mu.Lock()
+	defer tex.mu.Unlock()
+	tex.op = paint.NewImageOp(img)
+	tex.image = img
 }
 
 func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []DisplayTexture) []DisplayTexture {
