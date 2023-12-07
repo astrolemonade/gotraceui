@@ -458,6 +458,13 @@ type TimelinesComponent struct {
 }
 
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
+	var bytes float64
+	for _, tl := range tlc.cv.timelines {
+		for _, tr := range tl.tracks {
+			bytes += float64(len(tr.rnd.exactTextures) * texWidth * 4)
+		}
+	}
+	fmt.Println(bytes/1024/1024, "MiB")
 	return tlc.cv.Layout(win, gtx)
 }
 
