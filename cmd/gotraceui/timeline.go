@@ -972,47 +972,40 @@ func (track *Track) Layout(
 	}
 
 	allDspSpans := track.widget.prevFrame.dspSpans[:0]
-	if debugNewTexture {
+	if debugNewTexture || true {
 		// OPT(dh): reuse slice between frames
 		var texs []DisplayTexture
 		texs = track.rnd.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs)
 		for _, tex := range texs {
-			if tex.Image == nil {
-				continue
-			}
-			func() {
-				myop := paint.NewImageOp(tex.Image)
-				myop.Add(gtx.Ops)
-				stack := op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(tex.XScale, 40)).Offset(f32.Pt(tex.XOffset, 0))).Push(gtx.Ops)
-				paint.PaintOp{}.Add(gtx.Ops)
-				stack.Pop()
-			}()
+			tex.Add(gtx.Ops)
 		}
 	}
 
-	if cv.unchanged(gtx) && track.widget.prevFrame.dspSpans != nil && track.widget.prevFrame.placeholder == !haveSpans {
-		for _, prevSpans := range track.widget.prevFrame.dspSpans {
-			doSpans(prevSpans.dspSpans, prevSpans.startPx, prevSpans.endPx)
-		}
-	} else {
-		it := renderedSpansIterator{
-			cv:    cv,
-			spans: cv.visibleSpans(spans),
-		}
-		for {
-			dspSpans, startPx, endPx, ok := it.next(gtx)
-			if !ok {
-				break
+	if false || true {
+		if cv.unchanged(gtx) && track.widget.prevFrame.dspSpans != nil && track.widget.prevFrame.placeholder == !haveSpans {
+			for _, prevSpans := range track.widget.prevFrame.dspSpans {
+				doSpans(prevSpans.dspSpans, prevSpans.startPx, prevSpans.endPx)
+			}
+		} else {
+			it := renderedSpansIterator{
+				cv:    cv,
+				spans: cv.visibleSpans(spans),
+			}
+			for {
+				dspSpans, startPx, endPx, ok := it.next(gtx)
+				if !ok {
+					break
+				}
+
+				allDspSpans = append(allDspSpans, struct {
+					dspSpans       Items[ptrace.Span]
+					startPx, endPx float32
+				}{dspSpans, startPx, endPx})
+				doSpans(dspSpans, startPx, endPx)
 			}
 
-			allDspSpans = append(allDspSpans, struct {
-				dspSpans       Items[ptrace.Span]
-				startPx, endPx float32
-			}{dspSpans, startPx, endPx})
-			doSpans(dspSpans, startPx, endPx)
+			track.widget.prevFrame.dspSpans = allDspSpans
 		}
-
-		track.widget.prevFrame.dspSpans = allDspSpans
 	}
 
 	if track.kind == TrackKindUnspecified {
