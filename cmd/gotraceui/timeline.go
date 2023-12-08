@@ -140,7 +140,6 @@ func (tr *Track) Spans(win *theme.Window) *theme.Future[Items[ptrace.Span]] {
 	}
 
 	tr.spans = theme.NewFuture(win, func(cancelled <-chan struct{}) Items[ptrace.Span] {
-		time.Sleep(100 * time.Second)
 		bitunpackByte := func(bits uint8, dst *uint64) {
 			x64 := uint64(bits)
 			x_hi := x64 & 0xFE
@@ -780,6 +779,7 @@ func (track *Track) Layout(
 
 		// highlighted := filter.Match(dspSpans, ItemContainer{Timeline: tl, Track: track}) || automaticFilter.Match(dspSpans, ItemContainer{Timeline: tl, Track: track})
 		highlighted := false
+		isPlaceholder := dspSpans.Len() != 0 && dspSpans.At(0).State == statePlaceholder
 		if hovered {
 			// XXX if hovering a "merged" span then we can't just draw a rectangle for the highlight, because no span
 			// will be drawn on top of the border.
@@ -815,15 +815,19 @@ func (track *Track) Layout(
 			} else if !first && startPx == prevEndPx && !(highlighted || hovered) {
 				// Don't draw left border if it'd touch a right border, unless the span is highlighted
 			} else {
-				minP.X += float32(borderWidth)
+				if !isPlaceholder {
+					minP.X += float32(borderWidth)
+				}
 			}
 			prevEndPx = endPx
 
-			minP.Y += float32(borderWidth)
-			if endPx <= float32(gtx.Constraints.Max.X) {
-				maxP.X -= float32(borderWidth)
+			if !isPlaceholder {
+				minP.Y += float32(borderWidth)
+				if endPx <= float32(gtx.Constraints.Max.X) {
+					maxP.X -= float32(borderWidth)
+				}
+				maxP.Y -= float32(borderWidth)
 			}
-			maxP.Y -= float32(borderWidth)
 
 			if maxP.X-minP.X > 0 {
 				p := &paths[cs]

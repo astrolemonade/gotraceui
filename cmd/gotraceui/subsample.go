@@ -95,10 +95,9 @@ var (
 	backgroundUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
 	backgroundOp      = paint.NewImageOp(backgroundUniform)
 	// XXX find something better to display when we have no texture
-	placeholderUniform = image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
-	placeholderOp      = paint.NewImageOp(placeholderUniform)
-
-	stackPlaceholderUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0x00, 0xFF, 0xFF})
+	placeholderUniform      = image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
+	placeholderOp           = paint.NewImageOp(placeholderUniform)
+	stackPlaceholderUniform = image.NewUniform(colors[colorStatePlaceholderStackSpan].NRGBA())
 	stackPlaceholderOp      = paint.NewImageOp(stackPlaceholderUniform)
 )
 
@@ -141,9 +140,12 @@ func (tex TextureStack) Add(ops *op.Ops) {
 				paint.ColorOp{Color: stdcolor.NRGBA{f, f, f, 0xFF}}.Add(ops)
 			}
 
+			// The offset only affects the clip, while the scale affects both the clip and the image.
 			defer op.Affine(f32.Affine2D{}.Offset(f32.Pt(t.XOffset, 0))).Push(ops).Pop()
+			// XXX is there a way we can fill the current clip, without having to specify its height?
 			defer op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(t.XScale, 40))).Push(ops).Pop()
-			defer clip.Rect(image.Rect(0, 0, texWidth, 40)).Push(ops).Pop()
+			defer clip.Rect(image.Rect(0, 0, texWidth, 1)).Push(ops).Pop()
+
 			paint.PaintOp{}.Add(ops)
 			return
 		}
@@ -486,7 +488,6 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		// Don't go through the normal pipeline for making textures if the spans are placeholders (which happens when we
 		// are dealing with compressed tracks.). Caching them would be wrong, as cached textures don't get invalidated
 		// when spans change, and computing them is trivial.
-		// fmt.Println(start, end)
 		newStart := max(start, spans.At(0).Start)
 		newEnd := min(end, spans.At(0).End)
 		if newStart >= end || newEnd <= start {
