@@ -85,8 +85,8 @@ const (
 var debugTexturesComputing atomic.Int64
 
 type textureKey struct {
-	Start   trace.Timestamp
-	NsPerPx float64
+	start   trace.Timestamp
+	nsPerPx float64
 }
 
 type Texture struct {
@@ -195,8 +195,8 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	texKey := textureKey{
-		Start:   start,
-		NsPerPx: nsPerPx,
+		start:   start,
+		nsPerPx: nsPerPx,
 	}
 	tex := r.exactTextures[texKey]
 	foundExact := tex != nil
@@ -477,6 +477,27 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	}
 	if spanColor == nil {
 		spanColor = defaultSpanColor
+	}
+
+	if spans.Len() > 0 && spans.At(0).State == statePlaceholder {
+		// Don't go through the normal pipeline for making textures if the spans are placeholders (which happens when we
+		// are dealing with compressed tracks.). Caching them would be wrong, as cached textures don't get invalidated
+		// when spans change, and computing them is trivial.
+		out = append(out, TextureStack{
+			texs: []Texture{
+				Texture{
+					tex: &texture{
+						start:   start,
+						nsPerPx: nsPerPx,
+						image:   image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0x00, 0xFF}),
+						op:      paint.NewImageOp(image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0x00, 0xFF})),
+					},
+					XScale:  1,
+					XOffset: 0,
+				},
+			},
+		})
+		return out
 	}
 
 	origStart := start

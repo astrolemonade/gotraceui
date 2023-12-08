@@ -667,7 +667,6 @@ func (track *Track) Layout(
 
 	spans, haveSpans := track.Spans(win).ResultNoWait()
 	if !haveSpans {
-		// return layout.Dimensions{}
 		spans = SimpleItems[ptrace.Span]{
 			items: []ptrace.Span{
 				{
