@@ -411,6 +411,10 @@ func (cv *Canvas) zoom(gtx layout.Context, ticks float32, at f32.Point) {
 
 		start := cv.start + ds
 		end := cv.End() - de
+		if start == end {
+			// nsPerPx must never be 0.
+			end++
+		}
 		cv.start = start
 		cv.nsPerPx = float64(end-start) / float64(cv.width)
 	} else if ticks > 0 {

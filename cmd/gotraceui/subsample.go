@@ -1,5 +1,8 @@
 package main
 
+// TODO notes: we benchmarked planar RLE vs packed DEFLATE. compression, RLE was slightly faster at worse compression.
+// decompression, DEFLATE was 3x faster.
+
 // FIXME not too unexpectedly, we have seams when stitching textures, probably because of rounding errors and some
 // samples not belonging to either texture.
 
@@ -39,7 +42,12 @@ package main
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
 // and right.
 
+// TODO when animating a zoom, we may animate to a new level before we ever had a chance to finish computing the
+// previous level. in that case, it would make sense to cancel the computation of the previous level. More generally, we
+// could cancel every texture that wasn't used in a frame.
+
 import (
+	"fmt"
 	"image"
 	stdcolor "image/color"
 	"math"
@@ -47,13 +55,13 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/gotraceui/clip"
 	"honnef.co/go/gotraceui/color"
 	"honnef.co/go/gotraceui/container"
 	"honnef.co/go/gotraceui/theme"
-	"honnef.co/go/gotraceui/tinylfu"
 	"honnef.co/go/gotraceui/trace"
 	"honnef.co/go/gotraceui/trace/ptrace"
 
@@ -63,50 +71,24 @@ import (
 )
 
 const (
+	// Simulate a slow system by delaying texture computation by a random amount of time.
 	debugSlowRenderer     = false
 	debugDisplayGradients = false
 	debugDisplayZoom      = false
 
 	texWidth = 8192
+	// Offset log2(nsPerPx) by this much to ensure it is positive. 16 allows for 1 ns / 64k pixels, which realistically
+	// can never be used, because Gio doesn't support clip areas larger than 8k x 8k, and we don't allow zooming out
+	// more than 1 / window_width.
+	logOffset = 16
 )
 
-type Cache[K comparable, V any] struct {
-	mu sync.Mutex
-	t  *tinylfu.T[K, V]
-}
-
-func NewCache[K comparable, V any]() *Cache[K, V] {
-	return &Cache[K, V]{
-		t: tinylfu.New[K, V](1024, 1024*10),
-	}
-}
-
-func (c *Cache[K, V]) Get(k K) (V, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.t.Get(k)
-}
-
-func (c *Cache[K, V]) Add(k K, v V) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.t.Add(k, v)
-}
+// Counter of currently computing textures.
+var debugTexturesComputing atomic.Int64
 
 type textureKey struct {
 	Start   trace.Timestamp
 	NsPerPx float64
-}
-
-type Renderer struct {
-	oklchToLinear *Cache[color.Oklch, color.LinearSRGB]
-
-	// // XXX we want a smarter cache than this
-	// textures map[textureKey]*texture
-
-	exactTextures map[textureKey]*texture
-	// XXX 64 seems arbitrary
-	textures [64]*container.IntervalTree[trace.Timestamp, *texture]
 }
 
 type DisplayTexture2 struct {
@@ -157,9 +139,10 @@ type texture struct {
 	start   trace.Timestamp
 	nsPerPx float64
 
-	mu    sync.RWMutex
-	image image.Image
-	op    paint.ImageOp
+	mu         sync.RWMutex
+	computedIn time.Duration
+	image      image.Image
+	op         paint.ImageOp
 }
 
 func (tex *texture) ready() bool {
@@ -172,26 +155,43 @@ func (tex *texture) End() trace.Timestamp {
 	return tex.start + trace.Timestamp(texWidth*tex.nsPerPx)
 }
 
-// OPT reuse slice storage
-func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) []*texture {
-	if r.oklchToLinear == nil {
-		r.oklchToLinear = NewCache[color.Oklch, color.LinearSRGB]()
+type Renderer struct {
+	exactTextures map[textureKey]*texture
+	// textures is indexed by log2(nsPerPx). We allow for 80 levels [-16, 64]; 2**64 ns is 585 years and there will never be a
+	// valid reason for zooming in or out that far.
+	//
+	// OPT(dh): this is a lot of memory to spend per track
+	textures [64 + logOffset]*container.IntervalTree[trace.Timestamp, *texture]
+
+	// OPT(dh): can we afford this once per track?
+	mappedColors [len(colors)]color.LinearSRGB
+}
+
+func NewRenderer() *Renderer {
+	r := &Renderer{
+		exactTextures: map[textureKey]*texture{},
 	}
 	for i := range r.textures {
-		if r.textures[i] == nil {
-			r.textures[i] = container.NewIntervalTree[trace.Timestamp, *texture]()
-		}
+		r.textures[i] = container.NewIntervalTree[trace.Timestamp, *texture]()
 	}
-	if r.exactTextures == nil {
-		r.exactTextures = map[textureKey]*texture{}
+	for i, c := range colors {
+		r.mappedColors[i] = c.MapToSRGBGamut()
 	}
 
+	return r
+}
+
+// OPT reuse slice storage
+func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) []*texture {
 	// OPT(dh): reuse slice
 	// XXX this lookup doesn't allow using multiple textures to stitch together a bigger one. that is, when we need a texture for [0, 32] then we can't use [0, 16] + [16, 32]
 	start = max(start, 0)
 	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
 	end = min(end, tr.End())
-	logNsPerPx := int(math.Log2(nsPerPx))
+
+	if nsPerPx == 0 {
+		panic("got zero nsPerPx")
+	}
 
 	texKey := textureKey{
 		Start:   start,
@@ -218,6 +218,7 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	// We'll only find such textures after looking at a whole track and then zooming out further.
 	higherReady := false
 	foundHigher := false
+	logNsPerPx := int(math.Log2(nsPerPx)) + logOffset
 	for i := logNsPerPx - 1; i >= 0; i-- {
 		// OPT(dh): reuse slice
 		found := r.textures[i].Find(start, end, nil)
@@ -253,6 +254,7 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 		// OPT(dh): reuse slice
 		found := r.textures[i].Find(start, end, nil)
 		for _, f := range found {
+			fmt.Println(i, f.Value.Value.start, f.Value.Value.End())
 			// XXX instead of rejecting items here, run the correct query on the interval tree. right now we're selecting
 			// all nodes whose start lie in [start, end], when really we want all nodes whose [start, end] are a subset of
 			// the query range.
@@ -302,7 +304,32 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	return out
 }
 
+type pixel struct {
+	sum       color.LinearSRGB
+	sumWeight float64
+}
+
+var pixelsPool = &sync.Pool{
+	New: func() any {
+		s := make([]pixel, texWidth)
+		return &s
+	},
+}
+
 func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
+	debugTexturesComputing.Add(1)
+	defer debugTexturesComputing.Add(-1)
+
+	now := time.Now()
+	defer func() {
+		tex.mu.Lock()
+		tex.computedIn = time.Since(now)
+		tex.mu.Unlock()
+	}()
+
+	if nsPerPx == 0 {
+		panic("got zero nsPerPx")
+	}
 	first := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).End >= start
 	})
@@ -315,6 +342,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		defer tex.mu.Unlock()
 		tex.image = img
 		tex.op = paint.NewImageOp(img)
+		// OPT(dh): taking 1 us to get here seems a bit long. is it because of the binary search?
 		return
 	}
 
@@ -323,12 +351,10 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
 	}
 
-	type pixel struct {
-		sum       color.LinearSRGB
-		sumWeight float64
-	}
-
-	pixels := make([]pixel, texWidth)
+	pixelsPtr := pixelsPool.Get().(*[]pixel)
+	pixels := *pixelsPtr
+	clear(*pixelsPtr)
+	defer pixelsPool.Put(pixelsPtr)
 
 	addSample := func(bin int, w float64, v color.LinearSRGB) {
 		if w == 0 {
@@ -378,11 +404,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		lastBucket = min(lastBucket, texWidth)
 
 		colorIdx := spanColor(spans.At(i), tr)
-		c, ok := r.oklchToLinear.Get(colors[colorIdx])
-		if !ok {
-			c := colors[colorIdx].MapToSRGBGamut()
-			r.oklchToLinear.Add(colors[colorIdx], c)
-		}
+		c := r.mappedColors[colorIdx]
 
 		if int(firstBucket) == int(lastBucket) {
 			// falls into a single bucket
@@ -407,6 +429,8 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, texWidth, 1))
+	// Cache the conversion of the final pixel colors to sRGB.
+	srgbCache := map[color.LinearSRGB]stdcolor.RGBA{}
 	for x := range pixels {
 		px := &pixels[x]
 		px.sum.A = 1
@@ -418,7 +442,11 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 			px.sumWeight = 1
 		}
 
-		srgb := stdcolor.RGBAModel.Convert(px.sum.SRGB()).(stdcolor.RGBA)
+		srgb, ok := srgbCache[px.sum]
+		if !ok {
+			srgb = stdcolor.RGBAModel.Convert(px.sum.SRGB()).(stdcolor.RGBA)
+			srgbCache[px.sum] = srgb
+		}
 		i := img.PixOffset(x, 0)
 		s := img.Pix[i : i+4 : i+4] // Small cap improves performance, see https://golang.org/issue/27857
 		s[0] = srgb.R
@@ -434,6 +462,9 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 }
 
 func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []DisplayTexture) []DisplayTexture {
+	if nsPerPx == 0 {
+		panic("got zero nsPerPx")
+	}
 	if spanColor == nil {
 		spanColor = defaultSpanColor
 	}
@@ -447,7 +478,17 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	start = trace.Timestamp(m * math.Floor(float64(start)/m))
 
 	// texWidth is an integer pixel amount, and nsPerPx is rounded to a power of 2, ergo also integer.
-	step := trace.Timestamp(texWidth) * trace.Timestamp(nsPerPx)
+	step := trace.Timestamp(texWidth * nsPerPx)
+	if step == 0 {
+		// For a texWidth, if the user zooms to log2(pxPerNs) < -log2(texWidth), step will truncate to zero. As long as
+		// texWidth >= 8192, this should be impossible, because Gio doesn't support clip areas larger than 8192, and
+		// nsPerPx has to be at least 1 / window_width.
+		if texWidth < 8192 {
+			panic("got zero step with a texWidth < 8192")
+		} else {
+			panic("got zero step despite a texWidth >= 8192")
+		}
+	}
 	for start := start; start < end; start += step {
 		texs := r.renderTexture(start, nsPerPx, spans, tr, spanColor)
 
