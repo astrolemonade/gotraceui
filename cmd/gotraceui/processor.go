@@ -113,13 +113,17 @@ func processorInvalidateCache(tl *Timeline, cv *Canvas) bool {
 	return false
 }
 
-func processorTrackSpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
-	g := tr.G(tr.Event(span.Event).G)
+func processorTrackSpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	if spans.Len() != 1 {
+		return out
+	}
+	g := tr.G(tr.Event(spans.At(0).Event).G)
 	labels := tr.goroutineSpanLabels(g)
 	return append(out, labels...)
 }
 
-func processorTrackSpanColor(span ptrace.Span, tr *Trace) (out colorIndex) {
+func processorTrackSpanColor(spans Items[ptrace.Span], tr *Trace) (out colorIndex) {
+	span := spans.At(0)
 	if span.Tags&ptrace.SpanTagGC != 0 {
 		return colorStateGC
 	} else {

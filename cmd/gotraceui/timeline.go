@@ -106,8 +106,8 @@ type Track struct {
 	End   trace.Timestamp
 	Len   int
 
-	spanLabel       func(span ptrace.Span, tr *Trace, out []string) []string
-	spanColor       func(span ptrace.Span, tr *Trace) colorIndex
+	spanLabel       func(spans Items[ptrace.Span], tr *Trace, out []string) []string
+	spanColor       func(spans Items[ptrace.Span], tr *Trace) colorIndex
 	spanTooltip     func(win *theme.Window, gtx layout.Context, tr *Trace, state SpanTooltipState) layout.Dimensions
 	spanContextMenu func(spans Items[ptrace.Span], cv *Canvas) []*theme.MenuItem
 
@@ -534,8 +534,8 @@ func (tl *Timeline) Layout(
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, timelineHeight)}
 }
 
-func defaultSpanColor(span ptrace.Span, tr *Trace) colorIndex {
-	return stateColors[span.State]
+func defaultSpanColor(spans Items[ptrace.Span], tr *Trace) colorIndex {
+	return stateColors[spans.At(0).State]
 }
 
 type renderedSpansIterator struct {
@@ -767,9 +767,9 @@ func (track *Track) Layout(
 		var cs colorIndex
 		if dspSpans.Len() == 1 {
 			if track.spanColor != nil {
-				cs = track.spanColor(dspSpans.At(0), tr)
+				cs = track.spanColor(dspSpans, tr)
 			} else {
-				cs = defaultSpanColor(dspSpans.At(0), tr)
+				cs = defaultSpanColor(dspSpans, tr)
 			}
 		}
 
@@ -919,7 +919,7 @@ func (track *Track) Layout(
 				// empty string to effectively display no label.
 				//
 				// We don't try to render a label for very small spans.
-				if *labelsOut = track.spanLabel(dspSpans.At(0), tr, (*labelsOut)[:0]); len(*labelsOut) > 0 {
+				if *labelsOut = track.spanLabel(dspSpans, tr, (*labelsOut)[:0]); len(*labelsOut) > 0 {
 					for i, label := range *labelsOut {
 						if label == "" {
 							continue
@@ -1097,14 +1097,14 @@ func (track *Track) Layout(
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, trackHeight)}
 }
 
-func singleSpanLabel(label string) func(span ptrace.Span, tr *Trace, out []string) []string {
-	return func(span ptrace.Span, tr *Trace, out []string) []string {
+func singleSpanLabel(label string) func(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	return func(spans Items[ptrace.Span], tr *Trace, out []string) []string {
 		return append(out, label)
 	}
 }
 
-func singleSpanColor(c colorIndex) func(span ptrace.Span, tr *Trace) colorIndex {
-	return func(span ptrace.Span, tr *Trace) colorIndex {
+func singleSpanColor(c colorIndex) func(spans Items[ptrace.Span], tr *Trace) colorIndex {
+	return func(spans Items[ptrace.Span], tr *Trace) colorIndex {
 		return c
 	}
 }
@@ -1166,7 +1166,8 @@ func NewSTWTimeline(cv *Canvas, tr *Trace, spans []ptrace.Span) *Timeline {
 		tl.tracks[0].Len = len(spans)
 	}
 	tl.tracks[0].spans = theme.Immediate[Items[ptrace.Span]](ss)
-	tl.tracks[0].spanLabel = func(span ptrace.Span, tr *Trace, out []string) []string {
+	tl.tracks[0].spanLabel = func(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+		span := spans.At(0)
 		kindID := tr.Events[span.Event].Args[trace.ArgSTWStartKind]
 		return append(out, stwSpanLabels[tr.STWReason(kindID)])
 	}

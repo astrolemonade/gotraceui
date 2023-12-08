@@ -12,7 +12,11 @@ import (
 	"honnef.co/go/gotraceui/trace/ptrace"
 )
 
-func machineTrack0SpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
+func machineTrack0SpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	if spans.Len() != 1 {
+		return out
+	}
+	span := spans.At(0)
 	switch span.State {
 	case ptrace.StateRunningP:
 		p := tr.P(tr.Event(span.Event).P)
@@ -71,13 +75,17 @@ func machineTrack0SpanContextMenu(spans Items[ptrace.Span], cv *Canvas) []*theme
 	return items
 }
 
-func machineTrack1SpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
-	g := tr.G(tr.Event(span.Event).G)
+func machineTrack1SpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	if spans.Len() != 1 {
+		return out
+	}
+	g := tr.G(tr.Event(spans.At(0).Event).G)
 	labels := tr.goroutineSpanLabels(g)
 	return append(out, labels...)
 }
 
-func machineTrack1SpanColor(span ptrace.Span, tr *Trace) colorIndex {
+func machineTrack1SpanColor(spans Items[ptrace.Span], tr *Trace) colorIndex {
+	span := spans.At(0)
 	gid := tr.Events[span.Event].G
 	g := tr.G(gid)
 	switch fn := g.Function.Fn; fn {

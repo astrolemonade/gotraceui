@@ -136,7 +136,7 @@ func (mwin *MainWindow) openSpan(s Items[ptrace.Span]) {
 	var label string
 
 	if c, ok := s.Container(); ok && c.Track.spanLabel != nil {
-		labels = c.Track.spanLabel(s.At(0), c.Timeline.cv.trace, nil)
+		labels = c.Track.spanLabel(s, c.Timeline.cv.trace, nil)
 	}
 	if len(labels) > 0 {
 		label = labels[0]

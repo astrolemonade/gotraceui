@@ -79,7 +79,11 @@ var stateNamesCapitalized = [ptrace.StateLast]string{
 	ptrace.StateStack:                   "Stack frame",
 }
 
-func goroutineTrack0SpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
+func goroutineTrack0SpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	if spans.Len() != 1 {
+		return out
+	}
+	span := spans.At(0)
 	state := span.State
 	if state == ptrace.StateBlockedSyscall {
 		ev := tr.Event(span.Event)
@@ -136,18 +140,23 @@ func goroutineTrack0SpanContextMenu(spans Items[ptrace.Span], cv *Canvas) []*the
 	return items
 }
 
-func userRegionSpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
+func userRegionSpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	if spans.Len() != 1 {
+		return out
+	}
 	// OPT(dh): avoid this allocation
-	s := tr.Strings[tr.Events[span.Event].Args[trace.ArgUserRegionTypeID]]
+	s := tr.Strings[tr.Events[spans.At(0).Event].Args[trace.ArgUserRegionTypeID]]
 	return append(out, s)
 }
 
-func stackSpanLabel(span ptrace.Span, tr *Trace, out []string) []string {
-	if span.State == statePlaceholder {
+func stackSpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) []string {
+	if spans.Len() != 1 {
 		return out
 	}
-	// pc := spans.(MetadataSpans[stackSpanMeta]).MetadataAt(0).pc
-	var pc uint64
+	if spans.At(0).State == statePlaceholder {
+		return out
+	}
+	pc := spans.(MetadataSpans[stackSpanMeta]).MetadataAt(0).pc
 	f := tr.PCs[pc]
 
 	short := shortenFunctionName(f.Fn)
@@ -776,7 +785,8 @@ func addStackTracks(tl *Timeline, g *ptrace.Goroutine, tr *Trace) {
 		// TODO(dh): should we highlight hovered spans that share the same function?
 		tr.spanLabel = stackSpanLabel
 		tr.spanTooltip = stackSpanTooltip(i - stackTrackBase)
-		tr.spanColor = func(span ptrace.Span, tr *Trace) colorIndex {
+		tr.spanColor = func(spans Items[ptrace.Span], tr *Trace) colorIndex {
+			span := spans.At(0)
 			if state := span.State; state == statePlaceholder {
 				return colorStatePlaceholderStackSpan
 			} else {
