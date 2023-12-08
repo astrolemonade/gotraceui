@@ -140,6 +140,7 @@ func (tr *Track) Spans(win *theme.Window) *theme.Future[Items[ptrace.Span]] {
 	}
 
 	tr.spans = theme.NewFuture(win, func(cancelled <-chan struct{}) Items[ptrace.Span] {
+		time.Sleep(100 * time.Second)
 		bitunpackByte := func(bits uint8, dst *uint64) {
 			x64 := uint64(bits)
 			x_hi := x64 & 0xFE

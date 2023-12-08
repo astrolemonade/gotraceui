@@ -84,6 +84,24 @@ const (
 // Counter of currently computing textures.
 var debugTexturesComputing atomic.Int64
 
+var pixelsPool = &sync.Pool{
+	New: func() any {
+		s := make([]pixel, texWidth)
+		return &s
+	},
+}
+
+var (
+	backgroundUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
+	backgroundOp      = paint.NewImageOp(backgroundUniform)
+	// XXX find something better to display when we have no texture
+	placeholderUniform = image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
+	placeholderOp      = paint.NewImageOp(placeholderUniform)
+
+	stackPlaceholderUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0x00, 0xFF, 0xFF})
+	stackPlaceholderOp      = paint.NewImageOp(stackPlaceholderUniform)
+)
+
 type textureKey struct {
 	start   trace.Timestamp
 	nsPerPx float64
@@ -304,21 +322,6 @@ type pixel struct {
 	sumWeight float64
 }
 
-var pixelsPool = &sync.Pool{
-	New: func() any {
-		s := make([]pixel, texWidth)
-		return &s
-	},
-}
-
-var (
-	backgroundUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
-	backgroundOp      = paint.NewImageOp(backgroundUniform)
-	// XXX find something better to display when we have no texture
-	placeholderUniform = image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
-	placeholderOp      = paint.NewImageOp(placeholderUniform)
-)
-
 func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(Items[ptrace.Span], *Trace) colorIndex) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
@@ -483,17 +486,23 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		// Don't go through the normal pipeline for making textures if the spans are placeholders (which happens when we
 		// are dealing with compressed tracks.). Caching them would be wrong, as cached textures don't get invalidated
 		// when spans change, and computing them is trivial.
+		// fmt.Println(start, end)
+		newStart := max(start, spans.At(0).Start)
+		newEnd := min(end, spans.At(0).End)
+		if newStart >= end || newEnd <= start {
+			return nil
+		}
 		out = append(out, TextureStack{
 			texs: []Texture{
 				Texture{
 					tex: &texture{
-						start:   start,
+						start:   newStart,
 						nsPerPx: nsPerPx,
-						image:   image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0x00, 0xFF}),
-						op:      paint.NewImageOp(image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0x00, 0xFF})),
+						image:   stackPlaceholderUniform,
+						op:      stackPlaceholderOp,
 					},
-					XScale:  1,
-					XOffset: 0,
+					XScale:  float32(float64(newEnd-newStart) / (nsPerPx * texWidth)),
+					XOffset: float32(float64(newStart-start) / nsPerPx),
 				},
 			},
 		})
