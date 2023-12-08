@@ -47,7 +47,6 @@ package main
 // could cancel every texture that wasn't used in a frame.
 
 import (
-	"fmt"
 	"image"
 	stdcolor "image/color"
 	"math"
@@ -60,7 +59,6 @@ import (
 
 	"honnef.co/go/gotraceui/clip"
 	"honnef.co/go/gotraceui/color"
-	"honnef.co/go/gotraceui/container"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace"
 	"honnef.co/go/gotraceui/trace/ptrace"
@@ -160,19 +158,19 @@ type Renderer struct {
 	// textures is indexed by log2(nsPerPx). We allow for 80 levels [-16, 64]; 2**64 ns is 585 years and there will never be a
 	// valid reason for zooming in or out that far.
 	//
+	// Textures are aligned to multiples of the texture width * nsPerPx and are all of teh same width, which is why we
+	// can use a simple slice and binary search, instead of needing an interval tree.
+	//
 	// OPT(dh): this is a lot of memory to spend per track
-	textures [64 + logOffset]*container.IntervalTree[trace.Timestamp, *texture]
+	textures [64 + logOffset][]*texture
 
-	// OPT(dh): can we afford this once per track?
+	// OPT(dh): can we afford this once per track? and should we? this mapping is identical for all tracks.
 	mappedColors [len(colors)]color.LinearSRGB
 }
 
 func NewRenderer() *Renderer {
 	r := &Renderer{
 		exactTextures: map[textureKey]*texture{},
-	}
-	for i := range r.textures {
-		r.textures[i] = container.NewIntervalTree[trace.Timestamp, *texture]()
 	}
 	for i, c := range colors {
 		r.mappedColors[i] = c.MapToSRGBGamut()
@@ -220,19 +218,17 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	foundHigher := false
 	logNsPerPx := int(math.Log2(nsPerPx)) + logOffset
 	for i := logNsPerPx - 1; i >= 0; i-- {
-		// OPT(dh): reuse slice
-		found := r.textures[i].Find(start, end, nil)
-		for _, f := range found {
-			// XXX instead of rejecting items here, run the correct query on the interval tree. right now we're selecting
-			// all nodes whose start lie in [start, end], when really we want all nodes whose [start, end] are a subset of
-			// the query range.
-			if f.Value.Value.start > start || f.Value.Value.End() < end {
-				continue
-			}
-
-			out = append(out, f.Value.Value)
-			foundHigher = true
-			if f.Value.Value.ready() {
+		textures := r.textures[i]
+		n := sort.Search(len(textures), func(j int) bool {
+			return r.textures[i][j].End() >= end
+		})
+		if n == len(textures) {
+			continue
+		}
+		f := textures[n]
+		if f.start <= start {
+			out = append(out, f)
+			if f.ready() {
 				// Don't collect more textures that'll never be used.
 				higherReady = true
 				break
@@ -246,24 +242,20 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 		return out
 	}
 
-	// XXX this can't possibly be efficient
-	//
 	// Find a less zoomed in texture that covers our time range. We can upsample it on the GPU to get a blurry preview
 	// of the final texture.
 	for i := logNsPerPx + 1; i < len(r.textures); i++ {
-		// OPT(dh): reuse slice
-		found := r.textures[i].Find(start, end, nil)
-		for _, f := range found {
-			fmt.Println(i, f.Value.Value.start, f.Value.Value.End())
-			// XXX instead of rejecting items here, run the correct query on the interval tree. right now we're selecting
-			// all nodes whose start lie in [start, end], when really we want all nodes whose [start, end] are a subset of
-			// the query range.
-			if f.Value.Value.start > start || f.Value.Value.End() < end {
-				continue
-			}
-
-			out = append(out, f.Value.Value)
-			if f.Value.Value.ready() {
+		textures := r.textures[i]
+		n := sort.Search(len(textures), func(j int) bool {
+			return textures[j].End() >= end
+		})
+		if n == len(textures) {
+			continue
+		}
+		f := textures[n]
+		if f.start <= start {
+			out = append(out, f)
+			if f.ready() {
 				// Don't collect more textures that'll never be used.
 				break
 			}
@@ -271,13 +263,11 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	{
-		// XXX find something better to display when we have no texture
-		green := image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
 		greenTex := &texture{
 			start:   start,
 			nsPerPx: nsPerPx,
-			image:   green,
-			op:      paint.NewImageOp(green),
+			image:   placeholderUniform,
+			op:      placeholderOp,
 		}
 		out = append(out, greenTex)
 	}
@@ -297,7 +287,10 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 		nsPerPx: nsPerPx,
 	}
 	r.exactTextures[texKey] = tex
-	r.textures[logNsPerPx].Insert(start, end, tex)
+	n := sort.Search(len(r.textures[logNsPerPx]), func(i int) bool {
+		return r.textures[logNsPerPx][i].start >= start
+	})
+	r.textures[logNsPerPx] = slices.Insert(r.textures[logNsPerPx], n, tex)
 	slices.Insert(out, 0, tex)
 
 	go r.computeTexture(start, end, nsPerPx, spans, tex, tr, spanColor)
@@ -316,6 +309,14 @@ var pixelsPool = &sync.Pool{
 	},
 }
 
+var (
+	backgroundUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
+	backgroundOp      = paint.NewImageOp(backgroundUniform)
+	// XXX find something better to display when we have no texture
+	placeholderUniform = image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
+	placeholderOp      = paint.NewImageOp(placeholderUniform)
+)
+
 func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
@@ -330,25 +331,32 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}
+
+	if start >= end {
+		tex.mu.Lock()
+		defer tex.mu.Unlock()
+		tex.image = backgroundUniform
+		tex.op = backgroundOp
+		return
+	}
+
 	first := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).End >= start
 	})
 	last := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).Start >= end
 	})
-	if last <= first {
-		img := image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
+	if first >= last {
 		tex.mu.Lock()
 		defer tex.mu.Unlock()
-		tex.image = img
-		tex.op = paint.NewImageOp(img)
-		// OPT(dh): taking 1 us to get here seems a bit long. is it because of the binary search?
+		tex.image = backgroundUniform
+		tex.op = backgroundOp
 		return
 	}
 
 	if debugSlowRenderer {
 		// Simulate a slow renderer.
-		time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+		time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
 	}
 
 	pixelsPtr := pixelsPool.Get().(*[]pixel)
