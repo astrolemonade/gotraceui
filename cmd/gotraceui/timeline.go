@@ -974,7 +974,7 @@ func (track *Track) Layout(
 	allDspSpans := track.widget.prevFrame.dspSpans[:0]
 	if !debugNewTexture {
 		// OPT(dh): reuse slice between frames
-		var texs []DisplayTexture
+		var texs []TextureStack
 		texs = track.rnd.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs)
 		for _, tex := range texs {
 			tex.Add(gtx.Ops)

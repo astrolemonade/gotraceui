@@ -89,17 +89,17 @@ type textureKey struct {
 	NsPerPx float64
 }
 
-type DisplayTexture2 struct {
+type Texture struct {
 	tex     *texture
 	XScale  float32
 	XOffset float32
 }
 
-type DisplayTexture struct {
-	texs []DisplayTexture2
+type TextureStack struct {
+	texs []Texture
 }
 
-func (tex DisplayTexture) Add(ops *op.Ops) {
+func (tex TextureStack) Add(ops *op.Ops) {
 	for _, t := range tex.texs {
 		t.tex.mu.RLock()
 		if t.tex.image != nil {
@@ -166,6 +166,9 @@ type Renderer struct {
 
 	// OPT(dh): can we afford this once per track? and should we? this mapping is identical for all tracks.
 	mappedColors [len(colors)]color.LinearSRGB
+
+	// storage reused by Render
+	texsOut []*texture
 }
 
 func NewRenderer() *Renderer {
@@ -180,7 +183,7 @@ func NewRenderer() *Renderer {
 }
 
 // OPT reuse slice storage
-func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) []*texture {
+func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
 	// OPT(dh): reuse slice
 	// XXX this lookup doesn't allow using multiple textures to stitch together a bigger one. that is, when we need a texture for [0, 32] then we can't use [0, 16] + [16, 32]
 	start = max(start, 0)
@@ -198,7 +201,6 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	tex := r.exactTextures[texKey]
 	foundExact := tex != nil
 
-	var out []*texture
 	if tex != nil {
 		out = append(out, tex)
 
@@ -469,7 +471,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 	tex.image = img
 }
 
-func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []DisplayTexture) []DisplayTexture {
+func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}
@@ -497,19 +499,22 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 			panic("got zero step despite a texWidth >= 8192")
 		}
 	}
+	texs := r.texsOut
 	for start := start; start < end; start += step {
-		texs := r.renderTexture(start, nsPerPx, spans, tr, spanColor)
+		texs = r.renderTexture(start, nsPerPx, spans, tr, spanColor, texs[:0])
 
-		var texs2 []DisplayTexture2
+		var texs2 []Texture
 		for _, tex := range texs {
-			texs2 = append(texs2, DisplayTexture2{
+			texs2 = append(texs2, Texture{
 				tex:     tex,
 				XScale:  float32(tex.nsPerPx / origNsPerPx),
 				XOffset: float32(float64(tex.start-origStart) / origNsPerPx),
 			})
 		}
-		out = append(out, DisplayTexture{texs: texs2})
+		out = append(out, TextureStack{texs: texs2})
 	}
+	clear(texs)
+	r.texsOut = texs[:0]
 
 	return out
 }
