@@ -107,7 +107,7 @@ type Track struct {
 	Len   int
 
 	spanLabel       func(spans Items[ptrace.Span], tr *Trace, out []string) []string
-	spanColor       func(spans Items[ptrace.Span], tr *Trace) colorIndex
+	spanColor       func(span ptrace.Span, tr *Trace) colorIndex
 	spanTooltip     func(win *theme.Window, gtx layout.Context, tr *Trace, state SpanTooltipState) layout.Dimensions
 	spanContextMenu func(spans Items[ptrace.Span], cv *Canvas) []*theme.MenuItem
 
@@ -536,8 +536,8 @@ func (tl *Timeline) Layout(
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, timelineHeight)}
 }
 
-func defaultSpanColor(spans Items[ptrace.Span], tr *Trace) colorIndex {
-	return stateColors[spans.At(0).State]
+func defaultSpanColor(span ptrace.Span, tr *Trace) colorIndex {
+	return stateColors[span.State]
 }
 
 type renderedSpansIterator struct {
@@ -770,9 +770,9 @@ func (track *Track) Layout(
 		var cs colorIndex
 		if dspSpans.Len() == 1 {
 			if track.spanColor != nil {
-				cs = track.spanColor(dspSpans, tr)
+				cs = track.spanColor(dspSpans.At(0), tr)
 			} else {
-				cs = defaultSpanColor(dspSpans, tr)
+				cs = defaultSpanColor(dspSpans.At(0), tr)
 			}
 		}
 
@@ -1114,8 +1114,8 @@ func singleSpanLabel(label string) func(spans Items[ptrace.Span], tr *Trace, out
 	}
 }
 
-func singleSpanColor(c colorIndex) func(spans Items[ptrace.Span], tr *Trace) colorIndex {
-	return func(spans Items[ptrace.Span], tr *Trace) colorIndex {
+func singleSpanColor(c colorIndex) func(span ptrace.Span, tr *Trace) colorIndex {
+	return func(span ptrace.Span, tr *Trace) colorIndex {
 		return c
 	}
 }

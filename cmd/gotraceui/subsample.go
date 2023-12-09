@@ -278,7 +278,7 @@ func NewRenderer() *Renderer {
 }
 
 // OPT reuse slice storage
-func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(Items[ptrace.Span], *Trace) colorIndex, out []*texture) []*texture {
+func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
 	// OPT(dh): reuse slice
 	// XXX this lookup doesn't allow using multiple textures to stitch together a bigger one. that is, when we need a texture for [0, 32] then we can't use [0, 16] + [16, 32]
 	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
@@ -401,7 +401,7 @@ type pixel struct {
 	sumWeight float64
 }
 
-func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(Items[ptrace.Span], *Trace) colorIndex) {
+func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
 
@@ -489,7 +489,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		firstBucket = max(firstBucket, 0)
 		lastBucket = min(lastBucket, texWidth)
 
-		colorIdx := spanColor(spans.Slice(i, i+1), tr)
+		colorIdx := spanColor(spans.At(i), tr)
 		c := mappedColors[colorIdx]
 
 		if int(firstBucket) == int(lastBucket) {
@@ -544,7 +544,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 	tex.set(img, paint.NewImageOp(img))
 }
 
-func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(Items[ptrace.Span], *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
+func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}

@@ -785,8 +785,7 @@ func addStackTracks(tl *Timeline, g *ptrace.Goroutine, tr *Trace) {
 		// TODO(dh): should we highlight hovered spans that share the same function?
 		tr.spanLabel = stackSpanLabel
 		tr.spanTooltip = stackSpanTooltip(i - stackTrackBase)
-		tr.spanColor = func(spans Items[ptrace.Span], tr *Trace) colorIndex {
-			span := spans.At(0)
+		tr.spanColor = func(span ptrace.Span, tr *Trace) colorIndex {
 			if state := span.State; state == statePlaceholder {
 				return colorStatePlaceholderStackSpan
 			} else {

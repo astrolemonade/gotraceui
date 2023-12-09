@@ -84,8 +84,7 @@ func machineTrack1SpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) [
 	return append(out, labels...)
 }
 
-func machineTrack1SpanColor(spans Items[ptrace.Span], tr *Trace) colorIndex {
-	span := spans.At(0)
+func machineTrack1SpanColor(span ptrace.Span, tr *Trace) colorIndex {
 	gid := tr.Events[span.Event].G
 	g := tr.G(gid)
 	switch fn := g.Function.Fn; fn {

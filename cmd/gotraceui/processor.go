@@ -122,8 +122,7 @@ func processorTrackSpanLabel(spans Items[ptrace.Span], tr *Trace, out []string) 
 	return append(out, labels...)
 }
 
-func processorTrackSpanColor(spans Items[ptrace.Span], tr *Trace) (out colorIndex) {
-	span := spans.At(0)
+func processorTrackSpanColor(span ptrace.Span, tr *Trace) (out colorIndex) {
 	if span.Tags&ptrace.SpanTagGC != 0 {
 		return colorStateGC
 	} else {
