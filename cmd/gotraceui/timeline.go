@@ -324,6 +324,8 @@ type TrackWidget struct {
 		call        op.CallOp
 		dims        layout.Dimensions
 		placeholder bool
+		// If set, the next frame may not use the cache
+		invalidCache bool
 
 		dspSpans []struct {
 			dspSpans       Items[ptrace.Span]
@@ -687,6 +689,7 @@ func (track *Track) Layout(
 		cv.unchanged(gtx) &&
 		(tl.invalidateCache == nil || !tl.invalidateCache(tl, cv)) &&
 		track.widget.prevFrame.placeholder == !haveSpans &&
+		!track.widget.prevFrame.invalidCache &&
 		gtx.Constraints == track.widget.prevFrame.constraints {
 
 		track.widget.prevFrame.call.Add(gtx.Ops)
@@ -696,6 +699,7 @@ func (track *Track) Layout(
 
 	track.widget.prevFrame.hovered = track.widget.hover.Hovered()
 	track.widget.prevFrame.constraints = gtx.Constraints
+	track.widget.prevFrame.invalidCache = false
 
 	origOps := gtx.Ops
 	gtx.Ops = track.widget.prevFrame.ops.Get()
@@ -981,35 +985,38 @@ func (track *Track) Layout(
 		var texs []TextureStack
 		texs = track.rnd.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs)
 		for _, tex := range texs {
-			tex.Add(gtx.Ops)
+			if !tex.Add(gtx.Ops) {
+				// OPT(dh): it'd be more efficient to only invalidate the frame once the best texture is ready, instead
+				// of rendering new frames to check if its ready.
+				op.InvalidateOp{}.Add(gtx.Ops)
+				track.widget.prevFrame.invalidCache = true
+			}
 		}
 	}
 
-	if false || true {
-		if cv.unchanged(gtx) && track.widget.prevFrame.dspSpans != nil && track.widget.prevFrame.placeholder == !haveSpans {
-			for _, prevSpans := range track.widget.prevFrame.dspSpans {
-				doSpans(prevSpans.dspSpans, prevSpans.startPx, prevSpans.endPx)
-			}
-		} else {
-			it := renderedSpansIterator{
-				cv:    cv,
-				spans: cv.visibleSpans(spans),
-			}
-			for {
-				dspSpans, startPx, endPx, ok := it.next(gtx)
-				if !ok {
-					break
-				}
-
-				allDspSpans = append(allDspSpans, struct {
-					dspSpans       Items[ptrace.Span]
-					startPx, endPx float32
-				}{dspSpans, startPx, endPx})
-				doSpans(dspSpans, startPx, endPx)
-			}
-
-			track.widget.prevFrame.dspSpans = allDspSpans
+	if cv.unchanged(gtx) && track.widget.prevFrame.dspSpans != nil && track.widget.prevFrame.placeholder == !haveSpans {
+		for _, prevSpans := range track.widget.prevFrame.dspSpans {
+			doSpans(prevSpans.dspSpans, prevSpans.startPx, prevSpans.endPx)
 		}
+	} else {
+		it := renderedSpansIterator{
+			cv:    cv,
+			spans: cv.visibleSpans(spans),
+		}
+		for {
+			dspSpans, startPx, endPx, ok := it.next(gtx)
+			if !ok {
+				break
+			}
+
+			allDspSpans = append(allDspSpans, struct {
+				dspSpans       Items[ptrace.Span]
+				startPx, endPx float32
+			}{dspSpans, startPx, endPx})
+			doSpans(dspSpans, startPx, endPx)
+		}
+
+		track.widget.prevFrame.dspSpans = allDspSpans
 	}
 
 	if track.kind == TrackKindUnspecified {

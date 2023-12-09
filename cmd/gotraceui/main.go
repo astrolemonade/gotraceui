@@ -458,7 +458,7 @@ type TimelinesComponent struct {
 }
 
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
-	if true {
+	if false {
 		var sum uint64
 		for _, tl := range tlc.cv.timelines {
 			for _, tr := range tl.tracks {

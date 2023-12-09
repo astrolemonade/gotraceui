@@ -96,10 +96,10 @@ var (
 	backgroundUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
 	backgroundOp      = paint.NewImageOp(backgroundUniform)
 	// XXX find something better to display when we have no texture
-	placeholderUniform      = image.NewUniform(stdcolor.NRGBA{0x00, 0xFF, 0x00, 0xFF})
-	placeholderOp           = paint.NewImageOp(placeholderUniform)
 	stackPlaceholderUniform = image.NewUniform(colors[colorStatePlaceholderStackSpan].NRGBA())
 	stackPlaceholderOp      = paint.NewImageOp(stackPlaceholderUniform)
+	placeholderUniform      = stackPlaceholderUniform
+	placeholderOp           = paint.NewImageOp(placeholderUniform)
 )
 
 type textureKey struct {
@@ -117,41 +117,43 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(ops *op.Ops) {
-	for _, t := range tex.texs {
-		t.tex.mu.RLock()
-		if t.tex.image != nil {
-			t.tex.op.Add(ops)
-			t.tex.mu.RUnlock()
-
-			if debugDisplayGradients {
-				// Display gradients in place of the texture. Good for seeing texture boundaries.
-				paint.LinearGradientOp{Stop1: f32.Pt(0, 0), Stop2: f32.Pt(texWidth, 0), Color1: stdcolor.NRGBA{0xFF, 0x00, 0x00, 0xFF}, Color2: stdcolor.NRGBA{0x00, 0x00, 0xFF, 0xFF}}.Add(ops)
-			} else if debugDisplayZoom {
-				// Display the zoom level of the texture.
-				ff := 128.0 * t.XScale
-				var f byte
-				if ff < 0 {
-					f = 0
-				} else if ff > 255 {
-					f = 255
-				} else {
-					f = byte(ff)
-				}
-				paint.ColorOp{Color: stdcolor.NRGBA{f, f, f, 0xFF}}.Add(ops)
-			}
-
-			// The offset only affects the clip, while the scale affects both the clip and the image.
-			defer op.Affine(f32.Affine2D{}.Offset(f32.Pt(t.XOffset, 0))).Push(ops).Pop()
-			// XXX is there a way we can fill the current clip, without having to specify its height?
-			defer op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(t.XScale, 40))).Push(ops).Pop()
-			defer clip.Rect(image.Rect(0, 0, texWidth, 1)).Push(ops).Pop()
-
-			paint.PaintOp{}.Add(ops)
-			return
+func (tex TextureStack) Add(ops *op.Ops) (best bool) {
+	for i, t := range tex.texs {
+		_, imgOp, ok := t.tex.get()
+		if !ok {
+			continue
 		}
-		t.tex.mu.RUnlock()
+
+		if debugDisplayGradients {
+			// Display gradients in place of the texture. Good for seeing texture boundaries.
+			paint.LinearGradientOp{Stop1: f32.Pt(0, 0), Stop2: f32.Pt(texWidth, 0), Color1: stdcolor.NRGBA{0xFF, 0x00, 0x00, 0xFF}, Color2: stdcolor.NRGBA{0x00, 0x00, 0xFF, 0xFF}}.Add(ops)
+		} else if debugDisplayZoom {
+			// Display the zoom level of the texture.
+			ff := 128.0 * t.XScale
+			var f byte
+			if ff < 0 {
+				f = 0
+			} else if ff > 255 {
+				f = 255
+			} else {
+				f = byte(ff)
+			}
+			paint.ColorOp{Color: stdcolor.NRGBA{f, f, f, 0xFF}}.Add(ops)
+		} else {
+			imgOp.Add(ops)
+		}
+
+		// The offset only affects the clip, while the scale affects both the clip and the image.
+		defer op.Affine(f32.Affine2D{}.Offset(f32.Pt(t.XOffset, 0))).Push(ops).Pop()
+		// XXX is there a way we can fill the current clip, without having to specify its height?
+		defer op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(t.XScale, 40))).Push(ops).Pop()
+		defer clip.Rect(image.Rect(0, 0, texWidth, 1)).Push(ops).Pop()
+
+		paint.PaintOp{}.Add(ops)
+		return i == 0
 	}
+	// We always expect a ready fallback texture to be available.
+	panic("unreachable")
 }
 
 type texture struct {
@@ -162,6 +164,25 @@ type texture struct {
 	computedIn time.Duration
 	image      image.Image
 	op         paint.ImageOp
+}
+
+func (tex *texture) get() (image.Image, paint.ImageOp, bool) {
+	tex.mu.RLock()
+	defer tex.mu.RUnlock()
+	img := tex.image
+	op := tex.op
+	if img != nil {
+		return img, op, true
+	} else {
+		return nil, paint.ImageOp{}, false
+	}
+}
+
+func (tex *texture) set(img image.Image, op paint.ImageOp) {
+	tex.mu.Lock()
+	defer tex.mu.Unlock()
+	tex.image = img
+	tex.op = op
 }
 
 func (tex *texture) ready() bool {
@@ -197,9 +218,7 @@ type Renderer struct {
 func (r *Renderer) MemoryUsage() uint64 {
 	var size uint64
 	for _, tex := range r.exactTextures {
-		tex.mu.RLock()
-		img := tex.image
-		tex.mu.RUnlock()
+		img, _, _ := tex.get()
 		switch img := img.(type) {
 		case *image.Uniform:
 			size += 4
@@ -228,7 +247,6 @@ func NewRenderer() *Renderer {
 func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(Items[ptrace.Span], *Trace) colorIndex, out []*texture) []*texture {
 	// OPT(dh): reuse slice
 	// XXX this lookup doesn't allow using multiple textures to stitch together a bigger one. that is, when we need a texture for [0, 32] then we can't use [0, 16] + [16, 32]
-	start = max(start, 0)
 	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
 	end = min(end, tr.End())
 
@@ -307,13 +325,13 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	{
-		greenTex := &texture{
+		placeholderTex := &texture{
 			start:   start,
 			nsPerPx: nsPerPx,
 			image:   placeholderUniform,
 			op:      placeholderOp,
 		}
-		out = append(out, greenTex)
+		out = append(out, placeholderTex)
 	}
 
 	if foundHigher || foundExact {
@@ -362,10 +380,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 	}
 
 	if start >= end {
-		tex.mu.Lock()
-		defer tex.mu.Unlock()
-		tex.image = backgroundUniform
-		tex.op = backgroundOp
+		tex.set(backgroundUniform, backgroundOp)
 		return
 	}
 
@@ -376,10 +391,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		return spans.At(i).Start >= end
 	})
 	if first >= last {
-		tex.mu.Lock()
-		defer tex.mu.Unlock()
-		tex.image = backgroundUniform
-		tex.op = backgroundOp
+		tex.set(backgroundUniform, backgroundOp)
 		return
 	}
 
@@ -492,10 +504,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		s[3] = srgb.A
 	}
 
-	tex.mu.Lock()
-	defer tex.mu.Unlock()
-	tex.op = paint.NewImageOp(img)
-	tex.image = img
+	tex.set(img, paint.NewImageOp(img))
 }
 
 func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(Items[ptrace.Span], *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
@@ -538,6 +547,9 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	// spend scaling the same zoom level.
 	nsPerPx = math.Pow(2, math.Floor(math.Log2(nsPerPx)))
 	m := texWidth * nsPerPx
+	// Nothing interesting happens before the start of the trace. Limiting start here instead of in renderTexture
+	// ensures we don't generate more textures than necessary.
+	start = max(0, start)
 	start = trace.Timestamp(m * math.Floor(float64(start)/m))
 
 	// texWidth is an integer pixel amount, and nsPerPx is rounded to a power of 2, ergo also integer.
