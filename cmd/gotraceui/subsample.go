@@ -335,7 +335,7 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 		return r.textures[logNsPerPx][i].start >= start
 	})
 	r.textures[logNsPerPx] = slices.Insert(r.textures[logNsPerPx], n, tex)
-	slices.Insert(out, 0, tex)
+	out = slices.Insert(out, 0, tex)
 
 	go r.computeTexture(start, end, nsPerPx, spans, tex, tr, spanColor)
 	return out
