@@ -458,35 +458,32 @@ type TimelinesComponent struct {
 }
 
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
+	if true {
+		var sum uint64
+		for _, tl := range tlc.cv.timelines {
+			for _, tr := range tl.tracks {
+				sum += tr.rnd.MemoryUsage()
+			}
+		}
+		fmt.Printf("%f MiB\n", float64(sum)/1024/1024)
+	}
 	if false {
-		var bytes float64
 		var d time.Duration
 		var n int
 		for _, tl := range tlc.cv.timelines {
 			for _, tr := range tl.tracks {
 				for _, tex := range tr.rnd.exactTextures {
 					tex.mu.RLock()
-					switch img := tex.image.(type) {
-					case *image.RGBA:
-						bytes += float64(len(img.Pix))
+					if tex.image != nil {
 						d += tex.computedIn
 						n++
-					case *image.Uniform:
-						bytes += 4
-						d += tex.computedIn
-						n++
-					case nil:
-					default:
-						panic(fmt.Sprintf("%T", img))
 					}
 					tex.mu.RUnlock()
 				}
 			}
 		}
 		if n != 0 {
-			fmt.Println(bytes/1024/1024, "MiB", "\t", d/time.Duration(n))
-		} else {
-			fmt.Println(bytes/1024/1024, "MiB")
+			fmt.Println(d / time.Duration(n))
 		}
 	}
 

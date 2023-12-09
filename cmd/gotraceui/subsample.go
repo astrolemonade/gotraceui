@@ -47,6 +47,7 @@ package main
 // could cancel every texture that wasn't used in a frame.
 
 import (
+	"fmt"
 	"image"
 	stdcolor "image/color"
 	"math"
@@ -189,6 +190,27 @@ type Renderer struct {
 
 	// storage reused by Render
 	texsOut []*texture
+}
+
+// MemoryUsage returns the approximate cumulative size in bytes of all cached textures. It doesn't account for slice
+// headers or other overhead and only considers actual image data.
+func (r *Renderer) MemoryUsage() uint64 {
+	var size uint64
+	for _, tex := range r.exactTextures {
+		tex.mu.RLock()
+		img := tex.image
+		tex.mu.RUnlock()
+		switch img := img.(type) {
+		case *image.Uniform:
+			size += 4
+		case *image.RGBA:
+			size += uint64(len(img.Pix))
+		case nil:
+		default:
+			panic(fmt.Sprintf("unhandled type %T", img))
+		}
+	}
+	return size
 }
 
 func NewRenderer() *Renderer {
