@@ -93,9 +93,8 @@ var pixelsPool = &sync.Pool{
 }
 
 var (
-	backgroundUniform = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
-	backgroundOp      = paint.NewImageOp(backgroundUniform)
-	// XXX find something better to display when we have no texture
+	backgroundUniform       = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
+	backgroundOp            = paint.NewImageOp(backgroundUniform)
 	stackPlaceholderUniform = image.NewUniform(colors[colorStatePlaceholderStackSpan].NRGBA())
 	stackPlaceholderOp      = paint.NewImageOp(stackPlaceholderUniform)
 	placeholderUniform      = stackPlaceholderUniform
@@ -196,6 +195,25 @@ func (tex *texture) End() trace.Timestamp {
 }
 
 type Renderer struct {
+	// OPT this type is _way_ too large to have one per track of. right now it is 2320 bytes large, and Sean's trace
+	// from hell has 5.5 GB of renderers. we can reduce it by 15% by not having a per-renderer mappedColors.
+	//
+	// the obvious choice, of putting the renderer in the track widget, isn't straightforward, because we want to retain
+	// textures even for tracks we can no longer see.
+	//
+	// we could have a global [80]map[*Track][]*texture (or map[{*Track, level}], but then every texture lookup turns from an array index
+	// operation into a map lookup.
+	//
+	// we could have a single renderer per timeline, by adjusting the search algorithms to account for textures for the
+	// wrong tracks. for Sean's trace from hell, timelines / tracks = 0.0777. this would reduce memory usage from 5.5 GB
+	// to 388 MB (before removing mappedColors). however, this still scales memory usage linearly, just with the number
+	// of timelines instead of tracks. it'd be nice to have sub-linear memory increase.
+	//
+	// can we just store all textures in a single slice, sorted by (level, start), or would that make the binary
+	// searches too cost-intensive? this would reduce memory usage to 118 MB (including removing mappedColors) if
+	// storing per-track renderers, or 9 MB if storing per-timeline renderers and sorting by (level, start, track).
+	// still linear scaling, but at 56 bytes per timeline, as opposed to 2320 bytes, we really don't have to care.
+
 	exactTextures map[textureKey]*texture
 	// textures is indexed by log2(nsPerPx). We allow for 80 levels [-16, 64]; 2**64 ns is 585 years and there will never be a
 	// valid reason for zooming in or out that far.
