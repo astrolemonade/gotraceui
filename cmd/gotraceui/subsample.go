@@ -62,8 +62,6 @@ var pixelsPool = &sync.Pool{
 }
 
 var (
-	backgroundUniform       = image.NewUniform(stdcolor.NRGBA{0xFF, 0xFF, 0xEB, 0xFF})
-	backgroundOp            = paint.NewImageOp(backgroundUniform)
 	stackPlaceholderUniform = image.NewUniform(colors[colorStatePlaceholderStackSpan].NRGBA())
 	stackPlaceholderOp      = paint.NewImageOp(stackPlaceholderUniform)
 	placeholderUniform      = stackPlaceholderUniform
@@ -125,9 +123,14 @@ func (tex TextureStack) Add(ops *op.Ops) (best bool) {
 }
 
 type texture struct {
-	start      trace.Timestamp
-	nsPerPx    float64
-	logNsPerPx uint8
+	start trace.Timestamp
+	// The texture's effective nsPerPx. When rendering a texture for a given nsPerPx, its XScale should be nsPerPx /
+	// texture.nsPerPx.
+	nsPerPx float64
+
+	// The texture's zoom level, which is the log2 of the original nsPerPx, which may differ from the texture's
+	// effective nsPerPx.
+	level uint8
 
 	mu         sync.RWMutex
 	computedIn time.Duration
@@ -184,16 +187,16 @@ type Renderer struct {
 
 func texturesForLevelIndices(texs []*texture, level int) (start, end int) {
 	start = sort.Search(len(texs), func(i int) bool {
-		return texs[i].logNsPerPx >= uint8(level)
+		return texs[i].level >= uint8(level)
 	})
 	if start == len(texs) {
 		return start, start
 	}
-	if texs[start].logNsPerPx != uint8(level) {
+	if texs[start].level != uint8(level) {
 		return start, start
 	}
 	end = sort.Search(len(texs[start:]), func(i int) bool {
-		return texs[i+start].logNsPerPx >= uint8(level)+1
+		return texs[i+start].level >= uint8(level)+1
 	}) + start
 
 	return start, end
@@ -231,27 +234,21 @@ func NewRenderer() *Renderer {
 	return r
 }
 
-// OPT reuse slice storage
+// renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
+// textures at different zoom levels, sorted by zoom level in descending order. That is, the first texture has the
+// highest resolution.
 func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
 	if spans.Len() == 0 {
 		return out
 	}
 
-	start = max(
-		start,
-		spans.At(0).Start,
-	)
-	end := min(
-		trace.Timestamp(math.Ceil(float64(start)+nsPerPx*texWidth)),
-		spans.At(spans.Len()-1).End,
-	)
-
-	c, _ := spans.Container()
-	if g, ok := c.Timeline.item.(*ptrace.Goroutine); ok {
-		if g.ID == 1350 {
-			fmt.Println(start, end)
-		}
-	}
+	// The texture covers the time range [start, end]
+	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
+	// The effective end of the texture is limited to the track's end. This is important in two places. 1, when
+	// returning a uniform placeholder span, because it shouldn't be longer than the track. 2, when looking for an
+	// existing, higher resolution texture that covers the entire range. It doesn't have to cover the larger void
+	// produced by zooming out beyond the size of the track. It only has to cover up to the actual track end.
+	end = min(end, spans.At(spans.Len()-1).End)
 
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
@@ -326,14 +323,12 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	{
-		// FIXME(dh): we need to limit the width of the displayed uniform (e.g. by using XScale), else we'll show the
-		// placeholder beyond the end of the track.
 		placeholderTex := &texture{
-			start:      start,
-			nsPerPx:    nsPerPx,
-			logNsPerPx: uint8(logNsPerPx),
-			image:      placeholderUniform,
-			op:         placeholderOp,
+			start:   start,
+			nsPerPx: float64(end-start) / texWidth,
+			level:   uint8(logNsPerPx),
+			image:   placeholderUniform,
+			op:      placeholderOp,
 		}
 		out = append(out, placeholderTex)
 	}
@@ -349,9 +344,9 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	tex = &texture{
-		start:      start,
-		nsPerPx:    nsPerPx,
-		logNsPerPx: uint8(logNsPerPx),
+		start:   start,
+		nsPerPx: nsPerPx,
+		level:   uint8(logNsPerPx),
 	}
 	r.exactTextures[texKey] = tex
 	texsStart, texsEnd := texturesForLevelIndices(r.textures, logNsPerPx)
@@ -361,7 +356,7 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
-	go r.computeTexture(start, end, nsPerPx, spans, tex, tr, spanColor)
+	go r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor)
 	return out
 }
 
@@ -370,9 +365,14 @@ type pixel struct {
 	sumWeight float64
 }
 
-func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
+// computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
+// appropriate fields in tex.
+func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
+
+	// The texture covers the time range [start, end]
+	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
 
 	now := time.Now()
 	defer func() {
@@ -385,21 +385,12 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		panic("got zero nsPerPx")
 	}
 
-	if start >= end {
-		tex.set(backgroundUniform, backgroundOp)
-		return
-	}
-
 	first := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).End >= start
 	})
 	last := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).Start >= end
 	})
-	if first >= last {
-		tex.set(backgroundUniform, backgroundOp)
-		return
-	}
 
 	if debugSlowRenderer {
 		// Simulate a slow renderer.
@@ -513,6 +504,9 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 	tex.set(img, paint.NewImageOp(img))
 }
 
+// Render returns a series of textures that when placed next to each other will display spans for the time range [start,
+// end]. Each texture contains instructions for applying scaling and offsetting, and the series of textures may have
+// gaps, expecting the background to already look as desired.
 func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
@@ -534,17 +528,18 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		if newStart >= end || newEnd <= start {
 			return nil
 		}
+		tex := &texture{
+			start:   newStart,
+			nsPerPx: float64(newEnd-newStart) / texWidth,
+			image:   stackPlaceholderUniform,
+			op:      stackPlaceholderOp,
+			level:   uint8(math.Log2(nsPerPx)),
+		}
 		out = append(out, TextureStack{
 			texs: []Texture{
 				{
-					tex: &texture{
-						start:      newStart,
-						nsPerPx:    nsPerPx,
-						image:      stackPlaceholderUniform,
-						op:         stackPlaceholderOp,
-						logNsPerPx: uint8(math.Log2(nsPerPx)),
-					},
-					XScale:  float32(float64(newEnd-newStart) / (nsPerPx * texWidth)),
+					tex:     tex,
+					XScale:  float32(tex.nsPerPx / nsPerPx),
 					XOffset: float32(float64(newStart-start) / nsPerPx),
 				},
 			},
@@ -556,13 +551,24 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	origNsPerPx := nsPerPx
 	// TODO does log2(nsPerPx) grow the way we expect? in particular, the more zoomed out we are, the longer we want to
 	// spend scaling the same zoom level.
+	//
+	// Round nsPerPx to the next lower power of 2. A smaller nsPerPx will render a texture that is more zoomed in (and
+	// thus detailed) than requested. This also means that the time range covered by the texture is smaller than
+	// requested, and we may need to use multiple textures to cover the whole range.
 	nsPerPx = math.Pow(2, math.Floor(math.Log2(nsPerPx)))
 	m := texWidth * nsPerPx
-	// Nothing interesting happens before the start of the spans. Limiting start here instead of in renderTexture
-	// ensures we don't generate more textures than necessary.
+	// Shift start point to the left to align with a multiple of texWidth * nsPerPx...
 	start = trace.Timestamp(m * math.Floor(float64(start)/m))
+	// ... but don't set start point to before the track's start.
 	start = max(start, spans.At(0).Start)
+	// Don't set end beyond track's end. This doesn't have any effect on the computed texture, but limits how many
+	// textures we compute to cover the requested area.
 	end = min(end, spans.At(spans.Len()-1).End)
+
+	if start >= end {
+		// We don't need a texture for an empty time interval
+		return out[:0]
+	}
 
 	// texWidth is an integer pixel amount, and nsPerPx is rounded to a power of 2, ergo also integer.
 	step := trace.Timestamp(texWidth * nsPerPx)
@@ -583,8 +589,14 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		var texs2 []Texture
 		for _, tex := range texs {
 			texs2 = append(texs2, Texture{
-				tex:     tex,
-				XScale:  float32(tex.nsPerPx / origNsPerPx),
+				tex: tex,
+				// The texture has been rendered at a different scale than requested. At a minimum because we rounded it
+				// down to a power of 2, but also because uniform colors modify the scale to limit the width they draw
+				// at. Instruct the user to scale the texture to align things.
+				XScale: float32(tex.nsPerPx / origNsPerPx),
+				// The user wants to display the texture at origStart, but the texture's first pixel is actually for
+				// tex.start (with tex.start <= start <= origStart). Instruct the user to offset the texture to align
+				// things.
 				XOffset: float32(float64(tex.start-origStart) / origNsPerPx),
 			})
 		}
