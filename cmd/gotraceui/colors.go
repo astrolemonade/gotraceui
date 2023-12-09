@@ -49,6 +49,14 @@ var colors = [colorLast]color.Oklch{
 	colorStatePlaceholderStackSpan: oklch(92.59, 0.025, 106.88),
 }
 
+var mappedColors [len(colors)]color.LinearSRGB
+
+func init() {
+	for i, c := range colors {
+		mappedColors[i] = c.MapToSRGBGamut()
+	}
+}
+
 type colorIndex uint8
 
 const (

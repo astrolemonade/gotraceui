@@ -156,8 +156,9 @@ func (tex TextureStack) Add(ops *op.Ops) (best bool) {
 }
 
 type texture struct {
-	start   trace.Timestamp
-	nsPerPx float64
+	start      trace.Timestamp
+	nsPerPx    float64
+	logNsPerPx uint8
 
 	mu         sync.RWMutex
 	computedIn time.Duration
@@ -215,20 +216,38 @@ type Renderer struct {
 	// still linear scaling, but at 56 bytes per timeline, as opposed to 2320 bytes, we really don't have to care.
 
 	exactTextures map[textureKey]*texture
-	// textures is indexed by log2(nsPerPx). We allow for 80 levels [-16, 64]; 2**64 ns is 585 years and there will never be a
-	// valid reason for zooming in or out that far.
-	//
-	// Textures are aligned to multiples of the texture width * nsPerPx and are all of teh same width, which is why we
-	// can use a simple slice and binary search, instead of needing an interval tree.
-	//
-	// OPT(dh): this is a lot of memory to spend per track
-	textures [64 + logOffset][]*texture
 
-	// OPT(dh): can we afford this once per track? and should we? this mapping is identical for all tracks.
-	mappedColors [len(colors)]color.LinearSRGB
+	// Textures is sorted by (logNsPerPx, start). In other words, it contains textures sorted by start time, grouped and
+	// sorted by zoom level.
+	//
+	// Textures are aligned to multiples of the texture width * nsPerPx and are all of the same width, which is why we
+	// can use a simple slice and binary search to find a matching texture, instead of needing an interval tree.
+	textures []*texture
 
 	// storage reused by Render
 	texsOut []*texture
+}
+
+func texturesForLevelIndices(texs []*texture, level int) (start, end int) {
+	start = sort.Search(len(texs), func(i int) bool {
+		return texs[i].logNsPerPx >= uint8(level)
+	})
+	if start == len(texs) {
+		return start, start
+	}
+	if texs[start].logNsPerPx != uint8(level) {
+		return start, start
+	}
+	end = sort.Search(len(texs[start:]), func(i int) bool {
+		return texs[i+start].logNsPerPx >= uint8(level)+1
+	}) + start
+
+	return start, end
+}
+
+func texturesForLevel(texs []*texture, level int) []*texture {
+	start, end := texturesForLevelIndices(texs, level)
+	return texs[start:end]
 }
 
 // MemoryUsage returns the approximate cumulative size in bytes of all cached textures. It doesn't account for slice
@@ -253,9 +272,6 @@ func (r *Renderer) MemoryUsage() uint64 {
 func NewRenderer() *Renderer {
 	r := &Renderer{
 		exactTextures: map[textureKey]*texture{},
-	}
-	for i, c := range colors {
-		r.mappedColors[i] = c.MapToSRGBGamut()
 	}
 
 	return r
@@ -298,9 +314,9 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	foundHigher := false
 	logNsPerPx := int(math.Log2(nsPerPx)) + logOffset
 	for i := logNsPerPx - 1; i >= 0; i-- {
-		textures := r.textures[i]
+		textures := texturesForLevel(r.textures, i)
 		n := sort.Search(len(textures), func(j int) bool {
-			return r.textures[i][j].End() >= end
+			return textures[j].End() >= end
 		})
 		if n == len(textures) {
 			continue
@@ -324,8 +340,8 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 
 	// Find a less zoomed in texture that covers our time range. We can upsample it on the GPU to get a blurry preview
 	// of the final texture.
-	for i := logNsPerPx + 1; i < len(r.textures); i++ {
-		textures := r.textures[i]
+	for i := logNsPerPx + 1; i < 64+logOffset; i++ {
+		textures := texturesForLevel(r.textures, i)
 		n := sort.Search(len(textures), func(j int) bool {
 			return textures[j].End() >= end
 		})
@@ -344,10 +360,11 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 
 	{
 		placeholderTex := &texture{
-			start:   start,
-			nsPerPx: nsPerPx,
-			image:   placeholderUniform,
-			op:      placeholderOp,
+			start:      start,
+			nsPerPx:    nsPerPx,
+			logNsPerPx: uint8(logNsPerPx),
+			image:      placeholderUniform,
+			op:         placeholderOp,
 		}
 		out = append(out, placeholderTex)
 	}
@@ -363,14 +380,16 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	tex = &texture{
-		start:   start,
-		nsPerPx: nsPerPx,
+		start:      start,
+		nsPerPx:    nsPerPx,
+		logNsPerPx: uint8(logNsPerPx),
 	}
 	r.exactTextures[texKey] = tex
-	n := sort.Search(len(r.textures[logNsPerPx]), func(i int) bool {
-		return r.textures[logNsPerPx][i].start >= start
+	texsStart, texsEnd := texturesForLevelIndices(r.textures, logNsPerPx)
+	n := sort.Search(len(r.textures[texsStart:texsEnd]), func(i int) bool {
+		return r.textures[texsStart+i].start >= start
 	})
-	r.textures[logNsPerPx] = slices.Insert(r.textures[logNsPerPx], n, tex)
+	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
 	go r.computeTexture(start, end, nsPerPx, spans, tex, tr, spanColor)
@@ -471,7 +490,7 @@ func (r *Renderer) computeTexture(start, end trace.Timestamp, nsPerPx float64, s
 		lastBucket = min(lastBucket, texWidth)
 
 		colorIdx := spanColor(spans.Slice(i, i+1), tr)
-		c := r.mappedColors[colorIdx]
+		c := mappedColors[colorIdx]
 
 		if int(firstBucket) == int(lastBucket) {
 			// falls into a single bucket
@@ -546,10 +565,11 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 			texs: []Texture{
 				Texture{
 					tex: &texture{
-						start:   newStart,
-						nsPerPx: nsPerPx,
-						image:   stackPlaceholderUniform,
-						op:      stackPlaceholderOp,
+						start:      newStart,
+						nsPerPx:    nsPerPx,
+						image:      stackPlaceholderUniform,
+						op:         stackPlaceholderOp,
+						logNsPerPx: uint8(math.Log2(nsPerPx)),
 					},
 					XScale:  float32(float64(newEnd-newStart) / (nsPerPx * texWidth)),
 					XOffset: float32(float64(newStart-start) / nsPerPx),
