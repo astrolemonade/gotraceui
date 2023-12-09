@@ -279,10 +279,25 @@ func NewRenderer() *Renderer {
 
 // OPT reuse slice storage
 func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
-	// OPT(dh): reuse slice
-	// XXX this lookup doesn't allow using multiple textures to stitch together a bigger one. that is, when we need a texture for [0, 32] then we can't use [0, 16] + [16, 32]
-	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
-	end = min(end, tr.End())
+	if spans.Len() == 0 {
+		panic("XXX")
+	}
+
+	start = max(
+		start,
+		spans.At(0).Start,
+	)
+	end := min(
+		trace.Timestamp(math.Ceil(float64(start)+nsPerPx*texWidth)),
+		spans.At(spans.Len()-1).End,
+	)
+
+	c, _ := spans.Container()
+	if g, ok := c.Timeline.item.(*ptrace.Goroutine); ok {
+		if g.ID == 1350 {
+			fmt.Println(start, end)
+		}
+	}
 
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
@@ -304,8 +319,6 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 		}
 	}
 
-	// XXX this can't possibly be efficient
-	//
 	// Find a more zoomed in version of this texture, which we can downsample on the GPU by applying a smaller-than-one
 	// scale factor.
 	//
@@ -552,7 +565,11 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		spanColor = defaultSpanColor
 	}
 
-	if spans.Len() > 0 && spans.At(0).State == statePlaceholder {
+	if spans.Len() == 0 {
+		panic("XXX")
+	}
+
+	if spans.At(0).State == statePlaceholder {
 		// Don't go through the normal pipeline for making textures if the spans are placeholders (which happens when we
 		// are dealing with compressed tracks.). Caching them would be wrong, as cached textures don't get invalidated
 		// when spans change, and computing them is trivial.
@@ -585,10 +602,11 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	// spend scaling the same zoom level.
 	nsPerPx = math.Pow(2, math.Floor(math.Log2(nsPerPx)))
 	m := texWidth * nsPerPx
-	// Nothing interesting happens before the start of the trace. Limiting start here instead of in renderTexture
+	// Nothing interesting happens before the start of the spans. Limiting start here instead of in renderTexture
 	// ensures we don't generate more textures than necessary.
-	start = max(0, start)
 	start = trace.Timestamp(m * math.Floor(float64(start)/m))
+	start = max(start, spans.At(0).Start)
+	end = min(end, spans.At(spans.Len()-1).End)
 
 	// texWidth is an integer pixel amount, and nsPerPx is rounded to a power of 2, ergo also integer.
 	step := trace.Timestamp(texWidth * nsPerPx)
