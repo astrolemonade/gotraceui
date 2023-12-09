@@ -3,41 +3,6 @@ package main
 // TODO notes: we benchmarked planar RLE vs packed DEFLATE. compression, RLE was slightly faster at worse compression.
 // decompression, DEFLATE was 3x faster.
 
-// FIXME not too unexpectedly, we have seams when stitching textures, probably because of rounding errors and some
-// samples not belonging to either texture.
-
-/*
-   After we mapped a texture request to a rounded start and nsPerPx, we try to find entries in the cache in the following order:
-   - exact start + nsPerPx
-
-   - [start, end] is superset of ours, nsPerPx as close to ours as possible. it can only be larger, not smaller, as we
-     always use the same texture width and already round nsPerPx to powers of two. if the texture had a smaller nsPerPx,
-     i.e. was more zoomed in, it would have to cover a smaller part of the trace given the same texture width. It is
-     never worth computing this instead of an exact match, as computing more zoomed in textures is cheaper than
-     computing zoomed out ones.
-
-   - on-disk cache of the smallest nsPerPx required to view the entire trace. when super zoomed in this will be very low
-     resolution, but a better choice than showing nothing. This is only useful if we can cheaply load it from disk when
-     no better texture is available. Having to compute it would be slower than just computing the perfect texture.
-
-   - a placeholder texture
-
-*/
-
-/*
-   The UI requests textures to cover a [start, end] range of a track at a given nsPerPx.
-   We round the nsPerPx to the next lower power of 2 and the start to the next lower multiple of nsPerPx * texture width.
-
-   The resulting textures will be slightly more zoomed in than what the UI requested. The UI will scale the texture by a factor <=1
-   to zoom out as needed. This has the benefit that when the user is zooming in continuously, we can downsample the
-   texture on the GPU side, instead of having to upsample.
-
-   We may generate more than one texture to span the whole UI width, depending on the UI's width in relation to the
-   fixed texture width and panning. We want to find a good balance for texture size. Too narrow and we have to send more
-   commands to the GPU and handle more entries in the cache. Too wide and we increase latency when having to compute a
-   new texture.
-*/
-
 // TODO ahead of time generation of textures. when we request the texture for a zoom level, also generate the next zoom
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
 // and right.
@@ -79,6 +44,10 @@ const (
 	// Offset log2(nsPerPx) by this much to ensure it is positive. 16 allows for 1 ns / 64k pixels, which realistically
 	// can never be used, because Gio doesn't support clip areas larger than 8k x 8k, and we don't allow zooming out
 	// more than 1 / window_width.
+	//
+	// TODO(dh): the value of logOffset only matters because we iterate over all possible levels when looking for a
+	// texture in O(levels). if we optimized that, we could set logOffset arbitrarily large, e.g. 64. Our data
+	// structures are already sparse in the number of levels.
 	logOffset = 16
 )
 
@@ -196,25 +165,7 @@ func (tex *texture) End() trace.Timestamp {
 }
 
 type Renderer struct {
-	// OPT this type is _way_ too large to have one per track of. right now it is 2320 bytes large, and Sean's trace
-	// from hell has 5.5 GB of renderers. we can reduce it by 15% by not having a per-renderer mappedColors.
-	//
-	// the obvious choice, of putting the renderer in the track widget, isn't straightforward, because we want to retain
-	// textures even for tracks we can no longer see.
-	//
-	// we could have a global [80]map[*Track][]*texture (or map[{*Track, level}], but then every texture lookup turns from an array index
-	// operation into a map lookup.
-	//
-	// we could have a single renderer per timeline, by adjusting the search algorithms to account for textures for the
-	// wrong tracks. for Sean's trace from hell, timelines / tracks = 0.0777. this would reduce memory usage from 5.5 GB
-	// to 388 MB (before removing mappedColors). however, this still scales memory usage linearly, just with the number
-	// of timelines instead of tracks. it'd be nice to have sub-linear memory increase.
-	//
-	// can we just store all textures in a single slice, sorted by (level, start), or would that make the binary
-	// searches too cost-intensive? this would reduce memory usage to 118 MB (including removing mappedColors) if
-	// storing per-track renderers, or 9 MB if storing per-timeline renderers and sorting by (level, start, track).
-	// still linear scaling, but at 56 bytes per timeline, as opposed to 2320 bytes, we really don't have to care.
-
+	// OPT(dh): is having exactTextures worth it, or can we use textures instead?
 	exactTextures map[textureKey]*texture
 
 	// Textures is sorted by (logNsPerPx, start). In other words, it contains textures sorted by start time, grouped and
@@ -222,6 +173,9 @@ type Renderer struct {
 	//
 	// Textures are aligned to multiples of the texture width * nsPerPx and are all of the same width, which is why we
 	// can use a simple slice and binary search to find a matching texture, instead of needing an interval tree.
+	//
+	// OPT(dh): we could save memory by having one renderer per timeline instead of per track. For Sean's trace, we
+	// could reduce usage from 118 MB to 9 MB (at a 10 GB bias.)
 	textures []*texture
 
 	// storage reused by Render
@@ -280,7 +234,7 @@ func NewRenderer() *Renderer {
 // OPT reuse slice storage
 func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
 	if spans.Len() == 0 {
-		panic("XXX")
+		return out
 	}
 
 	start = max(
@@ -372,6 +326,8 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	}
 
 	{
+		// FIXME(dh): we need to limit the width of the displayed uniform (e.g. by using XScale), else we'll show the
+		// placeholder beyond the end of the track.
 		placeholderTex := &texture{
 			start:      start,
 			nsPerPx:    nsPerPx,
@@ -566,7 +522,7 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	}
 
 	if spans.Len() == 0 {
-		panic("XXX")
+		return out
 	}
 
 	if spans.At(0).State == statePlaceholder {
@@ -580,7 +536,7 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		}
 		out = append(out, TextureStack{
 			texs: []Texture{
-				Texture{
+				{
 					tex: &texture{
 						start:      newStart,
 						nsPerPx:    nsPerPx,

@@ -472,7 +472,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		var n int
 		for _, tl := range tlc.cv.timelines {
 			for _, tr := range tl.tracks {
-				for _, tex := range tr.rnd.exactTextures {
+				for _, tex := range tr.rnd.textures {
 					tex.mu.RLock()
 					if tex.image != nil {
 						d += tex.computedIn
