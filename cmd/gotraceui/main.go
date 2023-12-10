@@ -782,24 +782,18 @@ func (mwin *MainWindow) renderMainScene(win *theme.Window, gtx layout.Context) l
 	dims = theme.Resize(win.Theme, &mwin.resize).Layout(win, gtx, mainArea, panelArea)
 
 	func() {
-		// Display a dancing gopher while we're computing textures
+		// Display a dancing gopher while we're computing textures or unpacking stack tracks.
 		gtx := gtx
 		gtx.Constraints.Min = gtx.Constraints.Max
 
 		var suboptimal bool
-	tlLoop:
 		for _, tl := range mwin.canvas.prevFrame.displayedTls {
-			for _, track := range tl.tracks {
-				if track.widget == nil {
-					continue
-				}
-				sub := track.widget.prevFrame.usedSuboptimalTexture
-				// Only show the gopher if we've been loading textures for 100ms or longer. This avoids the majority of
-				// flickering gophers on fast machines and small traces.
-				if !sub.IsZero() && time.Since(sub) > 100*time.Millisecond {
-					suboptimal = true
-					break tlLoop
-				}
+			sub := tl.widget.usedSuboptimalTexture
+			// Only show the gopher if we've been loading textures for 100ms or longer. This avoids the majority of
+			// flickering gophers on fast machines and small traces.
+			if !sub.IsZero() && time.Since(sub) > 100*time.Millisecond {
+				suboptimal = true
+				break
 			}
 		}
 		if suboptimal {

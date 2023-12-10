@@ -79,6 +79,8 @@ type TimelineWidget struct {
 	clickedSpans   Items[ptrace.Span]
 	navigatedSpans Items[ptrace.Span]
 	hoveredSpans   Items[ptrace.Span]
+
+	usedSuboptimalTexture time.Time
 }
 
 func (tw *TimelineWidget) Hovered() bool {
@@ -301,9 +303,10 @@ type TrackWidget struct {
 	// mutate TimelineWidget's state.
 	//
 	// OPT(dh): clickedSpans and navigatedSpans are mutually exclusive, combine the fields
-	clickedSpans   Items[ptrace.Span]
-	navigatedSpans Items[ptrace.Span]
-	hoveredSpans   Items[ptrace.Span]
+	clickedSpans     Items[ptrace.Span]
+	navigatedSpans   Items[ptrace.Span]
+	hoveredSpans     Items[ptrace.Span]
+	lowQualityRender bool
 
 	// op lists get reused between frames to avoid generating garbage
 	ops                             [colorStateLast * 2]op.Ops
@@ -318,14 +321,13 @@ type TrackWidget struct {
 
 	// cached state
 	prevFrame struct {
-		hovered     bool
-		constraints layout.Constraints
-		ops         mem.ReusableOps
-		call        op.CallOp
-		dims        layout.Dimensions
-		placeholder bool
-
-		usedSuboptimalTexture time.Time
+		hovered      bool
+		constraints  layout.Constraints
+		ops          mem.ReusableOps
+		call         op.CallOp
+		dims         layout.Dimensions
+		placeholder  bool
+		invalidCache bool
 
 		dspSpans []struct {
 			dspSpans       Items[ptrace.Span]
@@ -498,6 +500,7 @@ func (tl *Timeline) Layout(
 		}
 	}
 
+	suboptimal := false
 	for _, track := range tl.tracks {
 		if track.kind == TrackKindStack && !tl.cv.timeline.displayStackTracks {
 			continue
@@ -513,6 +516,14 @@ func (tl *Timeline) Layout(
 		if spans := track.widget.ClickedSpans(); spans.Len() != 0 {
 			tl.widget.clickedSpans = spans
 		}
+		if track.widget.lowQualityRender {
+			suboptimal = true
+		}
+	}
+	if !suboptimal {
+		tl.widget.usedSuboptimalTexture = time.Time{}
+	} else if tl.widget.usedSuboptimalTexture.IsZero() {
+		tl.widget.usedSuboptimalTexture = gtx.Now
 	}
 	stack.Pop()
 
@@ -646,6 +657,7 @@ func (track *Track) Layout(
 	track.widget.clickedSpans = NoItems[ptrace.Span]{}
 	track.widget.navigatedSpans = NoItems[ptrace.Span]{}
 	track.widget.hoveredSpans = NoItems[ptrace.Span]{}
+	track.widget.lowQualityRender = false
 
 	trackClickedSpans := false
 	trackNavigatedSpans := false
@@ -681,6 +693,7 @@ func (track *Track) Layout(
 			contiguous: false,
 			subslice:   true,
 		}
+		track.widget.lowQualityRender = true
 	}
 
 	// // OPT(dh): don't redraw if the only change is cv.y
@@ -689,7 +702,7 @@ func (track *Track) Layout(
 		cv.unchanged(gtx) &&
 		(tl.invalidateCache == nil || !tl.invalidateCache(tl, cv)) &&
 		track.widget.prevFrame.placeholder == !haveSpans &&
-		track.widget.prevFrame.usedSuboptimalTexture.IsZero() &&
+		track.widget.prevFrame.invalidCache &&
 		gtx.Constraints == track.widget.prevFrame.constraints {
 
 		track.widget.prevFrame.call.Add(gtx.Ops)
@@ -699,7 +712,6 @@ func (track *Track) Layout(
 
 	track.widget.prevFrame.hovered = track.widget.hover.Hovered()
 	track.widget.prevFrame.constraints = gtx.Constraints
-	prevUsedSuboptimalTexture := track.widget.prevFrame.usedSuboptimalTexture
 
 	origOps := gtx.Ops
 	gtx.Ops = track.widget.prevFrame.ops.Get()
@@ -710,13 +722,6 @@ func (track *Track) Layout(
 		track.widget.prevFrame.placeholder = !haveSpans
 		track.widget.prevFrame.call = call
 		track.widget.prevFrame.dims = dims
-		if track.widget.prevFrame.usedSuboptimalTexture.Equal(gtx.Now) {
-			if !prevUsedSuboptimalTexture.IsZero() {
-				track.widget.prevFrame.usedSuboptimalTexture = prevUsedSuboptimalTexture
-			}
-		} else {
-			track.widget.prevFrame.usedSuboptimalTexture = time.Time{}
-		}
 	}()
 
 	// Draw timeline lifetimes
@@ -996,7 +1001,8 @@ func (track *Track) Layout(
 				// OPT(dh): it'd be more efficient to only invalidate the frame once the best texture is ready, instead
 				// of rendering new frames to check if its ready.
 				op.InvalidateOp{}.Add(gtx.Ops)
-				track.widget.prevFrame.usedSuboptimalTexture = gtx.Now
+				track.widget.prevFrame.invalidCache = true
+				track.widget.lowQualityRender = true
 			}
 		}
 	}
