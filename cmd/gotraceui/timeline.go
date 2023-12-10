@@ -998,7 +998,7 @@ func (track *Track) Layout(
 		var texs []TextureStack
 		texs = track.rnd.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs)
 		for _, tex := range texs {
-			if !tex.Add(gtx.Ops) {
+			if !tex.Add(win, gtx.Ops) {
 				track.widget.lowQualityRender = true
 			}
 		}

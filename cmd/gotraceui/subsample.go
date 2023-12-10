@@ -89,9 +89,9 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(ops *op.Ops) (best bool) {
+func (tex TextureStack) Add(win *theme.Window, ops *op.Ops) (best bool) {
 	for i, t := range tex.texs {
-		_, imgOp, ok := t.tex.get()
+		_, imgOp, ok := t.tex.get(win)
 		if !ok {
 			continue
 		}
@@ -134,6 +134,9 @@ type texture struct {
 	// texture.nsPerPx.
 	nsPerPx float64
 
+	// Last frame this texture was used in
+	lastUse uint64
+
 	// The texture's zoom level, which is the log2 of the original nsPerPx, which may differ from the texture's
 	// effective nsPerPx.
 	level uint8
@@ -147,7 +150,12 @@ type textureData struct {
 	op         paint.ImageOp
 }
 
-func (tex *texture) get() (image.Image, paint.ImageOp, bool) {
+func (tex *texture) get(win *theme.Window) (image.Image, paint.ImageOp, bool) {
+	tex.lastUse = win.Frame
+	return tex.getNoUse()
+}
+
+func (tex *texture) getNoUse() (image.Image, paint.ImageOp, bool) {
 	data, ok := tex.data.ResultNoWait()
 	if ok {
 		return data.image, data.op, true
@@ -211,7 +219,7 @@ func texturesForLevel(texs []*texture, level int) []*texture {
 func (r *Renderer) MemoryUsage() uint64 {
 	var size uint64
 	for _, tex := range r.exactTextures {
-		img, _, _ := tex.get()
+		img, _, _ := tex.getNoUse()
 		switch img := img.(type) {
 		case *image.Uniform:
 			size += 4
