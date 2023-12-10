@@ -7,9 +7,15 @@ package main
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
 // and right.
 
-// TODO when animating a zoom, we may animate to a new level before we ever had a chance to finish computing the
-// previous level. in that case, it would make sense to cancel the computation of the previous level. More generally, we
-// could cancel every texture that wasn't used in a frame.
+// TODO compress/delete unused textures
+
+// TODO fix borders for hovered merged spans
+
+// TODO document the architecture of this
+
+// TODO update license/readme/... to attribute the dancing gopher
+
+// TODO add back some tooltip to merged spans
 
 import (
 	"fmt"
@@ -160,10 +166,11 @@ func (tex *texture) End() trace.Timestamp {
 }
 
 type Renderer struct {
-	// OPT(dh): is having exactTextures worth it, or can we use textures instead?
+	// OPT(dh): is having exactTextures worth it, or can we use textures instead? if we remove it we can get rid of the
+	// constructor.
 	exactTextures map[textureKey]*texture
 
-	// Textures is sorted by (logNsPerPx, start). In other words, it contains textures sorted by start time, grouped and
+	// textures is sorted by (logNsPerPx, start). In other words, it contains textures sorted by start time, grouped and
 	// sorted by zoom level.
 	//
 	// Textures are aligned to multiples of the texture width * nsPerPx and are all of the same width, which is why we
@@ -351,7 +358,11 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 	out = slices.Insert(out, 0, tex)
 
 	tex.data = theme.NewFuture[textureData](win, func(cancelled <-chan struct{}) textureData {
-		return r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor)
+		if debugSlowRenderer {
+			// Simulate a slow renderer.
+			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
+		}
+		return r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
 	})
 	return out
 }
@@ -363,7 +374,7 @@ type pixel struct {
 
 // computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
 // appropriate fields in tex.
-func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) (out textureData) {
+func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) (out textureData) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
 
@@ -385,11 +396,6 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 	last := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).Start >= end
 	})
-
-	if debugSlowRenderer {
-		// Simulate a slow renderer.
-		time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
-	}
 
 	pixelsPtr := pixelsPool.Get().(*[]pixel)
 	pixels := *pixelsPtr
@@ -428,6 +434,13 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 	}
 
 	for i := first; i < last; i++ {
+		if i%10000 == 0 {
+			select {
+			case <-cancelled:
+				return
+			default:
+			}
+		}
 		span := spans.At(i)
 
 		firstBucket := float64(span.Start-start) / nsPerPx
@@ -466,6 +479,12 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 			// All the full buckets between the first and last one
 			addSample(i, 1, c)
 		}
+	}
+
+	select {
+	case <-cancelled:
+		return
+	default:
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, texWidth, 1))
