@@ -999,9 +999,6 @@ func (track *Track) Layout(
 		texs = track.rnd.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs)
 		for _, tex := range texs {
 			if !tex.Add(gtx.Ops) {
-				// OPT(dh): it'd be more efficient to only invalidate the frame once the best texture is ready, instead
-				// of rendering new frames to check if its ready.
-				op.InvalidateOp{}.Add(gtx.Ops)
 				track.widget.lowQualityRender = true
 			}
 		}

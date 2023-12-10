@@ -473,12 +473,11 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		for _, tl := range tlc.cv.timelines {
 			for _, tr := range tl.tracks {
 				for _, tex := range tr.rnd.textures {
-					tex.mu.RLock()
-					if tex.image != nil {
-						d += tex.computedIn
+					data, ok := tex.data.ResultNoWait()
+					if ok {
+						d += data.computedIn
 						n++
 					}
-					tex.mu.RUnlock()
 				}
 			}
 		}
@@ -791,9 +790,14 @@ func (mwin *MainWindow) renderMainScene(win *theme.Window, gtx layout.Context) l
 			sub := tl.widget.usedSuboptimalTexture
 			// Only show the gopher if we've been loading textures for 100ms or longer. This avoids the majority of
 			// flickering gophers on fast machines and small traces.
-			if !sub.IsZero() && time.Since(sub) > 100*time.Millisecond {
-				suboptimal = true
-				break
+			if !sub.IsZero() {
+				if gtx.Now.Sub(sub) > 100*time.Millisecond {
+					suboptimal = true
+					break
+				} else {
+					// Make sure we recheck the need for a dancing gopher.
+					op.InvalidateOp{At: gtx.Now.Add(100 * time.Millisecond)}.Add(gtx.Ops)
+				}
 			}
 		}
 		if suboptimal {

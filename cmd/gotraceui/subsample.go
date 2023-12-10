@@ -132,35 +132,27 @@ type texture struct {
 	// effective nsPerPx.
 	level uint8
 
-	mu         sync.RWMutex
+	data *theme.Future[textureData]
+}
+
+type textureData struct {
 	computedIn time.Duration
 	image      image.Image
 	op         paint.ImageOp
 }
 
 func (tex *texture) get() (image.Image, paint.ImageOp, bool) {
-	tex.mu.RLock()
-	defer tex.mu.RUnlock()
-	img := tex.image
-	op := tex.op
-	if img != nil {
-		return img, op, true
+	data, ok := tex.data.ResultNoWait()
+	if ok {
+		return data.image, data.op, true
 	} else {
 		return nil, paint.ImageOp{}, false
 	}
 }
 
-func (tex *texture) set(img image.Image, op paint.ImageOp) {
-	tex.mu.Lock()
-	defer tex.mu.Unlock()
-	tex.image = img
-	tex.op = op
-}
-
 func (tex *texture) ready() bool {
-	tex.mu.RLock()
-	defer tex.mu.RUnlock()
-	return tex.image != nil
+	_, ok := tex.data.ResultNoWait()
+	return ok
 }
 
 func (tex *texture) End() trace.Timestamp {
@@ -237,7 +229,7 @@ func NewRenderer() *Renderer {
 // renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
 // textures at different zoom levels, sorted by zoom level in descending order. That is, the first texture has the
 // highest resolution.
-func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
+func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
 	if spans.Len() == 0 {
 		return out
 	}
@@ -327,8 +319,10 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 			start:   start,
 			nsPerPx: float64(end-start) / texWidth,
 			level:   uint8(logNsPerPx),
-			image:   placeholderUniform,
-			op:      placeholderOp,
+			data: theme.Immediate(textureData{
+				image: placeholderUniform,
+				op:    placeholderOp,
+			}),
 		}
 		out = append(out, placeholderTex)
 	}
@@ -356,7 +350,9 @@ func (r *Renderer) renderTexture(start trace.Timestamp, nsPerPx float64, spans I
 	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
-	go r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor)
+	tex.data = theme.NewFuture[textureData](win, func(cancelled <-chan struct{}) textureData {
+		return r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor)
+	})
 	return out
 }
 
@@ -367,7 +363,7 @@ type pixel struct {
 
 // computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
 // appropriate fields in tex.
-func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) {
+func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex) (out textureData) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
 
@@ -376,9 +372,7 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 
 	now := time.Now()
 	defer func() {
-		tex.mu.Lock()
-		tex.computedIn = time.Since(now)
-		tex.mu.Unlock()
+		out.computedIn = time.Since(now)
 	}()
 
 	if nsPerPx == 0 {
@@ -502,7 +496,10 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 		s[3] = srgb.A
 	}
 
-	tex.set(img, paint.NewImageOp(img))
+	return textureData{
+		image: img,
+		op:    paint.NewImageOp(img),
+	}
 }
 
 // Render returns a series of textures that when placed next to each other will display spans for the time range [start,
@@ -532,9 +529,11 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		tex := &texture{
 			start:   newStart,
 			nsPerPx: float64(newEnd-newStart) / texWidth,
-			image:   stackPlaceholderUniform,
-			op:      stackPlaceholderOp,
-			level:   uint8(math.Log2(nsPerPx)),
+			data: theme.Immediate(textureData{
+				image: stackPlaceholderUniform,
+				op:    stackPlaceholderOp,
+			}),
+			level: uint8(math.Log2(nsPerPx)),
 		}
 		out = append(out, TextureStack{
 			texs: []Texture{
@@ -585,7 +584,7 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	}
 	texs := r.texsOut
 	for start := start; start < end; start += step {
-		texs = r.renderTexture(start, nsPerPx, spans, tr, spanColor, texs[:0])
+		texs = r.renderTexture(win, start, nsPerPx, spans, tr, spanColor, texs[:0])
 
 		var texs2 []Texture
 		for _, tex := range texs {
