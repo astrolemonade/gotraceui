@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"image"
 	stdcolor "image/color"
+	"log"
 	"math"
 	"math/rand"
 	"slices"
@@ -45,6 +46,7 @@ const (
 	debugSlowRenderer     = false
 	debugDisplayGradients = false
 	debugDisplayZoom      = false
+	debugTraceRenderer    = false
 
 	texWidth = 8192
 	// Offset log2(nsPerPx) by this much to ensure it is positive. 16 allows for 1 ns / 64k pixels, which realistically
@@ -73,6 +75,12 @@ var (
 	placeholderUniform      = stackPlaceholderUniform
 	placeholderOp           = paint.NewImageOp(placeholderUniform)
 )
+
+func renderTrace(f string, v ...any) {
+	if debugTraceRenderer {
+		log.Printf(f, v...)
+	}
+}
 
 type Texture struct {
 	tex     *texture
@@ -228,7 +236,10 @@ func (r *Renderer) MemoryUsage() uint64 {
 // textures at different zoom levels, sorted by zoom level in descending order. That is, the first texture has the
 // highest resolution.
 func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
+	renderTrace("  rendering texture at %d ns @ %f ns/px", start, nsPerPx)
+
 	if spans.Len() == 0 {
+		renderTrace("    no spans to render")
 		return out
 	}
 
@@ -240,15 +251,17 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 	// produced by zooming out beyond the size of the track. It only has to cover up to the actual track end.
 	end = min(end, spans.At(spans.Len()-1).End)
 
+	renderTrace("    effective end is %d", end)
+
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}
 
 	var tex *texture
 	logNsPerPx := int(math.Log2(nsPerPx)) + logOffset
-	textures := texturesForLevel(r.textures, logNsPerPx)
 	{
 		// Find an exact match
+		textures := texturesForLevel(r.textures, logNsPerPx)
 		n := sort.Search(len(textures), func(i int) bool {
 			return textures[i].start >= start
 		})
@@ -266,7 +279,10 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 
 		if tex.ready() {
 			// The desired texture already exists and is ready, skip doing any further work.
+			renderTrace("    exact match is already ready to use, returning early")
 			return out
+		} else {
+			renderTrace("    found exact match, but it isn't ready yet")
 		}
 	}
 
@@ -275,7 +291,7 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 	//
 	// We'll only find such textures after looking at a whole track and then zooming out further.
 	higherReady := false
-	foundHigher := false
+	foundHigher := 0
 	for i := logNsPerPx - 1; i >= 0; i-- {
 		textures := texturesForLevel(r.textures, i)
 		n := sort.Search(len(textures), func(j int) bool {
@@ -287,22 +303,28 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 		f := textures[n]
 		if f.start <= start {
 			out = append(out, f)
+			foundHigher++
 			if f.ready() {
 				// Don't collect more textures that'll never be used.
 				higherReady = true
+				renderTrace("    found ready higher resolution texture, not collecting any more")
 				break
 			}
 		}
 	}
 
+	renderTrace("    found %d higher resolution textures", foundHigher)
+
 	if higherReady {
 		// A higher resolution texture is already ready. There is no point in looking for lower resolution ones, or
 		// computing an exact match.
+		renderTrace("    found higher resolution texture that is already ready to use, returning early")
 		return out
 	}
 
 	// Find a less zoomed in texture that covers our time range. We can upsample it on the GPU to get a blurry preview
 	// of the final texture.
+	foundLower := 0
 	for i := logNsPerPx + 1; i < 64+logOffset; i++ {
 		textures := texturesForLevel(r.textures, i)
 		n := sort.Search(len(textures), func(j int) bool {
@@ -314,12 +336,16 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 		f := textures[n]
 		if f.start <= start {
 			out = append(out, f)
+			foundLower++
 			if f.ready() {
 				// Don't collect more textures that'll never be used.
+				renderTrace("    found ready lower resolution texture, not collecting any more")
 				break
 			}
 		}
 	}
+
+	renderTrace("    found %d lower resolution textures", foundLower)
 
 	{
 		placeholderTex := &texture{
@@ -334,9 +360,10 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 		out = append(out, placeholderTex)
 	}
 
-	if foundHigher || foundExact {
+	if foundHigher > 0 || foundExact {
 		// We're already waiting on either the exact match, or a higher resolution texture. In neither case do we want
 		// to start computing the exact match (again.)
+		renderTrace("    found an exact or higher resolution texture that is being computed, not starting another computation")
 		return out
 	}
 
@@ -376,6 +403,8 @@ type pixel struct {
 func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) (out textureData) {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
+
+	renderTrace("Computing texture at %d ns @ %f ns/px", start, nsPerPx)
 
 	// The texture covers the time range [start, end]
 	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
@@ -436,6 +465,7 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 		if i%10000 == 0 {
 			select {
 			case <-cancelled:
+				renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
 				return
 			default:
 			}
@@ -482,6 +512,7 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 
 	select {
 	case <-cancelled:
+		renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
 		return
 	default:
 	}
@@ -524,6 +555,12 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 // end]. Each texture contains instructions for applying scaling and offsetting, and the series of textures may have
 // gaps, expecting the background to already look as desired.
 func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
+	if c, ok := spans.Container(); ok {
+		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px in a track in timeline %q", start, end, nsPerPx, c.Timeline.shortName)
+	} else {
+		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px", start, end, nsPerPx)
+	}
+
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}
@@ -539,6 +576,8 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 		// Don't go through the normal pipeline for making textures if the spans are placeholders (which happens when we
 		// are dealing with compressed tracks.). Caching them would be wrong, as cached textures don't get invalidated
 		// when spans change, and computing them is trivial.
+		renderTrace("  returning uniform texture for stack placeholder")
+
 		newStart := max(start, spans.At(0).Start)
 		newEnd := min(end, spans.At(0).End)
 		if newStart >= end || newEnd <= start {
@@ -585,6 +624,7 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 
 	if start >= end {
 		// We don't need a texture for an empty time interval
+		renderTrace("  not returning textures for empty time interval [%d, %d]", start, end)
 		return out[:0]
 	}
 
