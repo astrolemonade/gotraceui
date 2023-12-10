@@ -74,11 +74,6 @@ var (
 	placeholderOp           = paint.NewImageOp(placeholderUniform)
 )
 
-type textureKey struct {
-	start   trace.Timestamp
-	nsPerPx float64
-}
-
 type Texture struct {
 	tex     *texture
 	XScale  float32
@@ -174,10 +169,6 @@ func (tex *texture) End() trace.Timestamp {
 }
 
 type Renderer struct {
-	// OPT(dh): is having exactTextures worth it, or can we use textures instead? if we remove it we can get rid of the
-	// constructor.
-	exactTextures map[textureKey]*texture
-
 	// textures is sorted by (logNsPerPx, start). In other words, it contains textures sorted by start time, grouped and
 	// sorted by zoom level.
 	//
@@ -218,7 +209,7 @@ func texturesForLevel(texs []*texture, level int) []*texture {
 // headers or other overhead and only considers actual image data.
 func (r *Renderer) MemoryUsage() uint64 {
 	var size uint64
-	for _, tex := range r.exactTextures {
+	for _, tex := range r.textures {
 		img, _, _ := tex.getNoUse()
 		switch img := img.(type) {
 		case *image.Uniform:
@@ -231,14 +222,6 @@ func (r *Renderer) MemoryUsage() uint64 {
 		}
 	}
 	return size
-}
-
-func NewRenderer() *Renderer {
-	r := &Renderer{
-		exactTextures: map[textureKey]*texture{},
-	}
-
-	return r
 }
 
 // renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
@@ -261,11 +244,21 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 		panic("got zero nsPerPx")
 	}
 
-	texKey := textureKey{
-		start:   start,
-		nsPerPx: nsPerPx,
+	var tex *texture
+	logNsPerPx := int(math.Log2(nsPerPx)) + logOffset
+	textures := texturesForLevel(r.textures, logNsPerPx)
+	{
+		// Find an exact match
+		n := sort.Search(len(textures), func(i int) bool {
+			return textures[i].start >= start
+		})
+		if n < len(textures) {
+			c := textures[n]
+			if c.start == start {
+				tex = c
+			}
+		}
 	}
-	tex := r.exactTextures[texKey]
 	foundExact := tex != nil
 
 	if tex != nil {
@@ -283,7 +276,6 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 	// We'll only find such textures after looking at a whole track and then zooming out further.
 	higherReady := false
 	foundHigher := false
-	logNsPerPx := int(math.Log2(nsPerPx)) + logOffset
 	for i := logNsPerPx - 1; i >= 0; i-- {
 		textures := texturesForLevel(r.textures, i)
 		n := sort.Search(len(textures), func(j int) bool {
@@ -357,7 +349,6 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 		nsPerPx: nsPerPx,
 		level:   uint8(logNsPerPx),
 	}
-	r.exactTextures[texKey] = tex
 	texsStart, texsEnd := texturesForLevelIndices(r.textures, logNsPerPx)
 	n := sort.Search(len(r.textures[texsStart:texsEnd]), func(i int) bool {
 		return r.textures[texsStart+i].start >= start

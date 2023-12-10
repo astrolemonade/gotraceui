@@ -113,7 +113,7 @@ type Track struct {
 	spanTooltip     func(win *theme.Window, gtx layout.Context, tr *Trace, state SpanTooltipState) layout.Dimensions
 	spanContextMenu func(spans Items[ptrace.Span], cv *Canvas) []*theme.MenuItem
 
-	rnd    *Renderer
+	rnd    Renderer
 	widget *TrackWidget
 }
 
@@ -121,7 +121,6 @@ func NewTrack(parent *Timeline, kind TrackKind) *Track {
 	return &Track{
 		parent: parent,
 		kind:   kind,
-		rnd:    NewRenderer(),
 	}
 }
 
