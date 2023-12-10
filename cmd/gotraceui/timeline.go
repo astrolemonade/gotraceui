@@ -321,13 +321,13 @@ type TrackWidget struct {
 
 	// cached state
 	prevFrame struct {
-		hovered      bool
-		constraints  layout.Constraints
-		ops          mem.ReusableOps
-		call         op.CallOp
-		dims         layout.Dimensions
-		placeholder  bool
-		invalidCache bool
+		hovered          bool
+		constraints      layout.Constraints
+		ops              mem.ReusableOps
+		call             op.CallOp
+		dims             layout.Dimensions
+		placeholder      bool
+		lowQualityRender bool
 
 		dspSpans []struct {
 			dspSpans       Items[ptrace.Span]
@@ -702,7 +702,7 @@ func (track *Track) Layout(
 		cv.unchanged(gtx) &&
 		(tl.invalidateCache == nil || !tl.invalidateCache(tl, cv)) &&
 		track.widget.prevFrame.placeholder == !haveSpans &&
-		track.widget.prevFrame.invalidCache &&
+		!track.widget.prevFrame.lowQualityRender &&
 		gtx.Constraints == track.widget.prevFrame.constraints {
 
 		track.widget.prevFrame.call.Add(gtx.Ops)
@@ -722,6 +722,7 @@ func (track *Track) Layout(
 		track.widget.prevFrame.placeholder = !haveSpans
 		track.widget.prevFrame.call = call
 		track.widget.prevFrame.dims = dims
+		track.widget.prevFrame.lowQualityRender = track.widget.lowQualityRender
 	}()
 
 	// Draw timeline lifetimes
@@ -1001,7 +1002,6 @@ func (track *Track) Layout(
 				// OPT(dh): it'd be more efficient to only invalidate the frame once the best texture is ready, instead
 				// of rendering new frames to check if its ready.
 				op.InvalidateOp{}.Add(gtx.Ops)
-				track.widget.prevFrame.invalidCache = true
 				track.widget.lowQualityRender = true
 			}
 		}
