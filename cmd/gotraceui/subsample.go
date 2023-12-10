@@ -481,6 +481,7 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 		px := &pixels[x]
 		px.sum.A = 1
 		if px.sumWeight < 1 {
+			// TODO(dh): can we ues transparent pixels instead?
 			w := 1 - px.sumWeight
 			px.sum.R += float32(w)
 			px.sum.G += float32(w)

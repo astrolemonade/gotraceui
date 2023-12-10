@@ -324,8 +324,8 @@ type TrackWidget struct {
 		call        op.CallOp
 		dims        layout.Dimensions
 		placeholder bool
-		// If set, the next frame may not use the cache
-		invalidCache bool
+
+		usedSuboptimalTexture time.Time
 
 		dspSpans []struct {
 			dspSpans       Items[ptrace.Span]
@@ -689,7 +689,7 @@ func (track *Track) Layout(
 		cv.unchanged(gtx) &&
 		(tl.invalidateCache == nil || !tl.invalidateCache(tl, cv)) &&
 		track.widget.prevFrame.placeholder == !haveSpans &&
-		!track.widget.prevFrame.invalidCache &&
+		track.widget.prevFrame.usedSuboptimalTexture.IsZero() &&
 		gtx.Constraints == track.widget.prevFrame.constraints {
 
 		track.widget.prevFrame.call.Add(gtx.Ops)
@@ -699,7 +699,7 @@ func (track *Track) Layout(
 
 	track.widget.prevFrame.hovered = track.widget.hover.Hovered()
 	track.widget.prevFrame.constraints = gtx.Constraints
-	track.widget.prevFrame.invalidCache = false
+	prevUsedSuboptimalTexture := track.widget.prevFrame.usedSuboptimalTexture
 
 	origOps := gtx.Ops
 	gtx.Ops = track.widget.prevFrame.ops.Get()
@@ -710,6 +710,13 @@ func (track *Track) Layout(
 		track.widget.prevFrame.placeholder = !haveSpans
 		track.widget.prevFrame.call = call
 		track.widget.prevFrame.dims = dims
+		if track.widget.prevFrame.usedSuboptimalTexture.Equal(gtx.Now) {
+			if !prevUsedSuboptimalTexture.IsZero() {
+				track.widget.prevFrame.usedSuboptimalTexture = prevUsedSuboptimalTexture
+			}
+		} else {
+			track.widget.prevFrame.usedSuboptimalTexture = time.Time{}
+		}
 	}()
 
 	// Draw timeline lifetimes
@@ -989,7 +996,7 @@ func (track *Track) Layout(
 				// OPT(dh): it'd be more efficient to only invalidate the frame once the best texture is ready, instead
 				// of rendering new frames to check if its ready.
 				op.InvalidateOp{}.Add(gtx.Ops)
-				track.widget.prevFrame.invalidCache = true
+				track.widget.prevFrame.usedSuboptimalTexture = gtx.Now
 			}
 		}
 	}
