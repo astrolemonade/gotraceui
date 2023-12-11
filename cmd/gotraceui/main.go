@@ -462,48 +462,50 @@ type TimelinesComponent struct {
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	// XXX move all of this code into Canvas.Layout
 
-	if globalStats.Memory() > 1*1024*1024 {
-		// fmt.Println("--- Before ---")
-		// XXX move globalStats to somewhere less global
-		// fmt.Println(&globalStats)
+	TOTAL.Store(0)
 
-		idx := tlc.compressTlIndex
-		// origIdx := idx
-		t := time.Now()
-		var looked, compressed uint64
-		// We only check the elapsed time after each timeline, but timelines can contain many tracks which
-		// contain many textures, and if a lot of them have to be compressed, we can exceed our time limit.
-		//
-		// The alternative, checking after each track, however, spends too much time in runtime.nanotime.
-		// for time.Since(t) < 100*time.Microsecond {
-		for _, tl := range tlc.cv.timelines[idx:] {
-			// idx = (idx + 1) % len(tlc.cv.timelines)
-			// tl := tlc.cv.timelines[idx]
-			_ = *tl
-			looked++
-			// for _, tr := range tl.tracks {
-			// 	_ = *tr
-			// 	looked++
-			// 	// a, b := tr.rnd.Compact(win.Frame)
-			// 	// looked += a
-			// 	// compressed += b
+	if true {
+		if globalStats.Memory() > 100*1024*1024 {
+			// fmt.Println("--- Before ---")
+			// XXX move globalStats to somewhere less global
+			// fmt.Println(&globalStats)
+
+			idx := tlc.compressTlIndex
+			origIdx := idx
+			t := time.Now()
+			var looked, compressed uint64
+			// We only check the elapsed time after each timeline, but timelines can contain many tracks which
+			// contain many textures, and if a lot of them have to be compressed, we can exceed our time limit.
+			//
+			// The alternative, checking after each track, however, spends too much time in runtime.nanotime.
+			for time.Since(t) < 100*time.Microsecond {
+				idx = (idx + 1) % len(tlc.cv.timelines)
+				tl := tlc.cv.timelines[idx]
+				for _, tr := range tl.tracks {
+					a, b := tr.Compact(win.Frame)
+					looked += a
+					compressed += b
+				}
+
+				if idx == origIdx {
+					break
+				}
+			}
+			tlc.compressTlIndex = idx
+
+			// fmt.Println("--- After ---")
+			// // XXX move globalStats to somewhere less global
+			// fmt.Println(&globalStats)
+			// // if n := totalCompressed.Load(); n == 0 {
+			// d := time.Since(t)
+			// fmt.Println("compressed", compressed, "textures, looked at", looked, "in", d)
 			// }
 
-			// if idx == origIdx {
-			// 	break
-			// }
+			// XXX it can happen that just the compressed textures take up too much memory, and freeing uncompressed
+			// textures alone won't be enough. but we never really know if we're in that state, because we'd have to look at
+			// all textures in one go, instead of incrementally.
+
 		}
-		// tlc.compressTlIndex = idx
-		tlc.compressTlIndex = 0
-
-		// fmt.Println("--- After ---")
-		// XXX move globalStats to somewhere less global
-		// fmt.Println(&globalStats)
-		// if n := totalCompressed.Load(); n == 0 {
-		d := time.Since(t)
-		fmt.Println("compressed", compressed, "textures, looked at", looked, "in", d)
-		// }
-
 	}
 
 	if false {
@@ -536,7 +538,14 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			fmt.Printf("Computing %d textures\n", n)
 		}
 	}
-	return tlc.cv.Layout(win, gtx)
+
+	ret := tlc.cv.Layout(win, gtx)
+
+	if n := TOTAL.Load(); n != 0 {
+		log.Println(time.Duration(n))
+	}
+
+	return ret
 }
 
 func (tlc *TimelinesComponent) Title() string {

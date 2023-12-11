@@ -154,6 +154,12 @@ type texture struct {
 	// effective nsPerPx.
 	level uint8
 
+	// Compressed stores the compressed version of the texture. This is always populated for image.RGBA-backed
+	// textures once computing it has finished. That is, we don't compress textures on demand. The average
+	// compression ratio depends on the shape of the trace and the zoom level, but seems to be anywhere around
+	// 15x to 150x. For 8192-wide textures, the increase from 32 KiB to 34 KiB (at a 15x ratio) is only a
+	// 6.25% increase in size. In return for that increase we don't have to spend 500 µs per texture we want
+	// to compress, and we only have to compress a given texture once.
 	compressed []byte
 	data       *theme.Future[textureData]
 }
@@ -169,25 +175,25 @@ func (tex *texture) get(win *theme.Window) (image.Image, paint.ImageOp, bool) {
 	return tex.getNoUse(win)
 }
 
+var TOTAL atomic.Uint64
+
 func (tex *texture) getNoUse(win *theme.Window) (image.Image, paint.ImageOp, bool) {
 	if tex.data == nil && len(tex.compressed) > 0 {
-		compressed := tex.compressed
-		tex.compressed = nil
-		globalStats.CompressedNum.Add(^uint64(0))
-		globalStats.CompressedSize.Add(uint64(-len(compressed)))
 		tex.data = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData {
 			pix := pixPool.Get().([]byte)
-			r := flate.NewReader(bytes.NewReader(compressed))
+			t := time.Now()
+			r := flate.NewReader(bytes.NewReader(tex.compressed))
 			io.ReadFull(r, pix)
 			if err := r.Close(); err != nil {
 				panic(fmt.Sprintf("error decompressing texture: %s", err))
 			}
+			TOTAL.Add(uint64(time.Since(t)))
 			img := &image.RGBA{
 				Pix:    pix,
 				Stride: 4,
 				Rect:   image.Rect(0, 0, texWidth, 1),
 			}
-			globalStats.TexturesNum.Add(1)
+			globalStats.RGBANum.Add(1)
 			return textureData{
 				image: img,
 				op:    paint.NewImageOp(img),
@@ -261,7 +267,7 @@ func texturesForLevel(texs []*texture, level int) []*texture {
 
 type RendererStatistics struct {
 	UniformsNum    atomic.Uint64
-	TexturesNum    atomic.Uint64
+	RGBANum        atomic.Uint64
 	CompressedNum  atomic.Uint64
 	CompressedSize atomic.Uint64
 	UnreadyNum     atomic.Uint64
@@ -276,37 +282,37 @@ var globalUsedBitmap struct {
 
 func (stats *RendererStatistics) Add(other *RendererStatistics) {
 	stats.UniformsNum.Add(other.UniformsNum.Load())
-	stats.TexturesNum.Add(other.TexturesNum.Load())
-	stats.CompressedNum.Add(other.CompressedNum.Load())
+	stats.RGBANum.Add(other.RGBANum.Load())
 	stats.CompressedSize.Add(other.CompressedSize.Load())
 	stats.UnreadyNum.Add(other.UnreadyNum.Load())
 }
 
 func (stats *RendererStatistics) String() string {
 	f := `Uniforms: %d (%f MiB)
-Textures: %d (%f MiB)
-Compressed: %d (%f MiB)
+RGBAs: %d (%f MiB)
+Compressed: %d (%f MiB, %f MiB uncompressed)
 Not ready/cancelled: %d`
 	return fmt.Sprintf(
 		f,
 		stats.UniformsNum.Load(), float64(stats.UniformsNum.Load()*4)/1024/1024,
-		stats.TexturesNum.Load(), float64(stats.TexturesNum.Load()*texWidth*4)/1024/1024,
-		stats.CompressedNum.Load(), float64(stats.CompressedSize.Load())/1024/1024,
+		stats.RGBANum.Load(), float64(stats.RGBANum.Load()*texWidth*4)/1024/1024,
+		stats.CompressedNum.Load(), float64(stats.CompressedSize.Load())/1024/1024, float64(stats.CompressedNum.Load()*texWidth*4)/1024/1024,
 		stats.UnreadyNum.Load(),
 	)
 }
 
 func (stats *RendererStatistics) Memory() uint64 {
-	return stats.TexturesNum.Load()*texWidth*4 +
+	return stats.RGBANum.Load()*texWidth*4 +
 		stats.UniformsNum.Load()*4 +
 		stats.CompressedSize.Load()
 }
 
-func (r *Renderer) Compact(frame uint64) (uint64, uint64) {
+func (track *Track) Compact(frame uint64) (uint64, uint64) {
+	r := &track.rnd
 	var n uint64
 	for _, tex := range r.textures {
 		// TODO(dh): we should probably measure in wall time, not frame time
-		if len(tex.compressed) != 0 || tex.lastUse >= frame-100 || tex.data == nil {
+		if tex.lastUse >= frame-100 || tex.data == nil {
 			continue
 		}
 		data, ok := tex.data.ResultNoWait()
@@ -318,27 +324,22 @@ func (r *Renderer) Compact(frame uint64) (uint64, uint64) {
 			continue
 		}
 
-		buf := bytes.NewBuffer(nil)
-		w, _ := flate.NewWriter(buf, flate.BestSpeed)
-		w.Write(img.Pix)
-		w.Close()
-		tex.compressed = buf.Bytes()
 		// lint:ignore SA6002 We can't actually avoid this allocation. The slice is stored as a non-pointer in
 		// a struct. We don't want to reuse an interior pointer to that struct.
 		pixPool.Put(img.Pix)
 		tex.data = nil
-		globalStats.TexturesNum.Add(^uint64(0))
-		globalStats.CompressedNum.Add(1)
-		globalStats.CompressedSize.Add(uint64(len(tex.compressed)))
+		globalStats.RGBANum.Add(^uint64(0))
 		n++
 	}
+
 	return uint64(len(r.textures)), n
 }
 
 // renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
 // textures at different zoom levels, sorted by zoom level in descending order. That is, the first texture has the
 // highest resolution.
-func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
+func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
+	r := &track.rnd
 	renderTrace("  rendering texture at %d ns @ %f ns/px", start, nsPerPx)
 
 	if spans.Len() == 0 {
@@ -491,12 +492,12 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 			// Simulate a slow renderer.
 			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
 		}
-		data := r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
+		data := track.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
 		switch data.image.(type) {
 		case *image.Uniform:
 			globalStats.UniformsNum.Add(1)
 		case *image.RGBA:
-			globalStats.TexturesNum.Add(1)
+			globalStats.RGBANum.Add(1)
 		case nil:
 			// Cancelled
 		default:
@@ -514,7 +515,8 @@ type pixel struct {
 
 // computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
 // appropriate fields in tex.
-func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) (out textureData) {
+func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) (out textureData) {
+	// r := &track.rnd
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
 
@@ -659,6 +661,15 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 		s[3] = srgb.A
 	}
 
+	buf := bytes.NewBuffer(nil)
+	w, _ := flate.NewWriter(buf, flate.BestSpeed)
+	w.Write(img.Pix)
+	w.Close()
+	// XXX this is racy
+	tex.compressed = buf.Bytes()
+	globalStats.CompressedNum.Add(1)
+	globalStats.CompressedSize.Add(uint64(len(tex.compressed)))
+
 	return textureData{
 		image: img,
 		op:    paint.NewImageOp(img),
@@ -668,7 +679,9 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 // Render returns a series of textures that when placed next to each other will display spans for the time range [start,
 // end]. Each texture contains instructions for applying scaling and offsetting, and the series of textures may have
 // gaps, expecting the background to already look as desired.
-func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
+func (track *Track) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
+	r := &track.rnd
+
 	if c, ok := spans.Container(); ok {
 		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px in a track in timeline %q", start, end, nsPerPx, c.Timeline.shortName)
 	} else {
@@ -756,7 +769,7 @@ func (r *Renderer) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx f
 	}
 	texs := r.texsOut
 	for start := start; start < end; start += step {
-		texs = r.renderTexture(win, start, nsPerPx, spans, tr, spanColor, texs[:0])
+		texs = track.renderTexture(win, start, nsPerPx, spans, tr, spanColor, texs[:0])
 
 		var texs2 []Texture
 		for _, tex := range texs {
