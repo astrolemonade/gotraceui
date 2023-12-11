@@ -455,17 +455,62 @@ func displayHighlightSpansDialog(win *theme.Window, filter *Filter) {
 
 type TimelinesComponent struct {
 	cv *Canvas
+
+	compressTlIndex int
 }
 
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
-	if false {
-		var sum uint64
-		for _, tl := range tlc.cv.timelines {
-			for _, tr := range tl.tracks {
-				sum += tr.rnd.MemoryUsage()
-			}
+	// XXX move all of this code into Canvas.Layout
+
+	if globalStats.Memory() > 1*1024*1024 {
+		// fmt.Println("--- Before ---")
+		// XXX move globalStats to somewhere less global
+		// fmt.Println(&globalStats)
+
+		idx := tlc.compressTlIndex
+		// origIdx := idx
+		t := time.Now()
+		var looked, compressed uint64
+		// We only check the elapsed time after each timeline, but timelines can contain many tracks which
+		// contain many textures, and if a lot of them have to be compressed, we can exceed our time limit.
+		//
+		// The alternative, checking after each track, however, spends too much time in runtime.nanotime.
+		// for time.Since(t) < 100*time.Microsecond {
+		for _, tl := range tlc.cv.timelines[idx:] {
+			// idx = (idx + 1) % len(tlc.cv.timelines)
+			// tl := tlc.cv.timelines[idx]
+			_ = *tl
+			looked++
+			// for _, tr := range tl.tracks {
+			// 	_ = *tr
+			// 	looked++
+			// 	// a, b := tr.rnd.Compact(win.Frame)
+			// 	// looked += a
+			// 	// compressed += b
+			// }
+
+			// if idx == origIdx {
+			// 	break
+			// }
 		}
-		fmt.Printf("%f MiB\n", float64(sum)/1024/1024)
+		// tlc.compressTlIndex = idx
+		tlc.compressTlIndex = 0
+
+		// fmt.Println("--- After ---")
+		// XXX move globalStats to somewhere less global
+		// fmt.Println(&globalStats)
+		// if n := totalCompressed.Load(); n == 0 {
+		d := time.Since(t)
+		fmt.Println("compressed", compressed, "textures, looked at", looked, "in", d)
+		// }
+
+	}
+
+	if false {
+		if win.Frame%1000 == 0 {
+			fmt.Println("--- Stats ---")
+			fmt.Println(&globalStats)
+		}
 	}
 	if false {
 		var d time.Duration
@@ -1624,7 +1669,7 @@ func loadTrace(f io.Reader, p progresser, cv *Canvas) (loadTraceResult, error) {
 	baseTimeline := len(timelines)
 	timelines = slices.Grow(timelines, len(tr.Goroutines))[:len(timelines)+len(tr.Goroutines)]
 	var progress atomic.Uint64
-	mysync.Distribute(tr.Goroutines, 0, func(group int, step int, subitems []*ptrace.Goroutine) error {
+	mysync.Distribute(tr.Goroutines, 0, nil, func(group int, step int, subitems []*ptrace.Goroutine) error {
 		for j, g := range subitems {
 			timelines[baseTimeline+group*step+j] = NewGoroutineTimeline(tr, cv, g)
 			pr := progress.Add(1)

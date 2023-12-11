@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-func Distribute[T any](items []T, limit int, fn func(group int, step int, subitems []T) error) error {
+func Distribute[T any](items []T, limit int, doInit func(numGroups int), fn func(group int, step int, subitems []T) error) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -23,6 +23,9 @@ func Distribute[T any](items []T, limit int, fn func(group int, step int, subite
 	var gerr error
 	var wg sync.WaitGroup
 	wg.Add(limit)
+	if doInit != nil {
+		doInit(limit)
+	}
 	for g := 0; g < limit; g++ {
 		g := g
 		go func() {

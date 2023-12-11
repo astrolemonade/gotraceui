@@ -18,11 +18,15 @@ package main
 // TODO add back some tooltip to merged spans
 
 import (
+	"bytes"
+	"compress/flate"
 	"fmt"
 	"image"
 	stdcolor "image/color"
+	"io"
 	"log"
 	"math"
+	"math/big"
 	"math/rand"
 	"slices"
 	"sort"
@@ -66,6 +70,12 @@ var pixelsPool = &sync.Pool{
 	New: func() any {
 		s := make([]pixel, texWidth)
 		return &s
+	},
+}
+
+var pixPool = &sync.Pool{
+	New: func() any {
+		return make([]uint8, texWidth*4)
 	},
 }
 
@@ -144,7 +154,8 @@ type texture struct {
 	// effective nsPerPx.
 	level uint8
 
-	data *theme.Future[textureData]
+	compressed []byte
+	data       *theme.Future[textureData]
 }
 
 type textureData struct {
@@ -155,10 +166,42 @@ type textureData struct {
 
 func (tex *texture) get(win *theme.Window) (image.Image, paint.ImageOp, bool) {
 	tex.lastUse = win.Frame
-	return tex.getNoUse()
+	return tex.getNoUse(win)
 }
 
-func (tex *texture) getNoUse() (image.Image, paint.ImageOp, bool) {
+func (tex *texture) getNoUse(win *theme.Window) (image.Image, paint.ImageOp, bool) {
+	if tex.data == nil && len(tex.compressed) > 0 {
+		compressed := tex.compressed
+		tex.compressed = nil
+		globalStats.CompressedNum.Add(^uint64(0))
+		globalStats.CompressedSize.Add(uint64(-len(compressed)))
+		tex.data = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData {
+			pix := pixPool.Get().([]byte)
+			r := flate.NewReader(bytes.NewReader(compressed))
+			io.ReadFull(r, pix)
+			if err := r.Close(); err != nil {
+				panic(fmt.Sprintf("error decompressing texture: %s", err))
+			}
+			img := &image.RGBA{
+				Pix:    pix,
+				Stride: 4,
+				Rect:   image.Rect(0, 0, texWidth, 1),
+			}
+			globalStats.TexturesNum.Add(1)
+			return textureData{
+				image: img,
+				op:    paint.NewImageOp(img),
+			}
+		})
+	}
+
+	return tex.getNoPopulate()
+}
+
+func (tex *texture) getNoPopulate() (image.Image, paint.ImageOp, bool) {
+	if tex.data == nil {
+		return nil, paint.ImageOp{}, false
+	}
 	data, ok := tex.data.ResultNoWait()
 	if ok {
 		return data.image, data.op, true
@@ -168,6 +211,9 @@ func (tex *texture) getNoUse() (image.Image, paint.ImageOp, bool) {
 }
 
 func (tex *texture) ready() bool {
+	if tex.data == nil {
+		return false
+	}
 	_, ok := tex.data.ResultNoWait()
 	return ok
 }
@@ -213,23 +259,80 @@ func texturesForLevel(texs []*texture, level int) []*texture {
 	return texs[start:end]
 }
 
-// MemoryUsage returns the approximate cumulative size in bytes of all cached textures. It doesn't account for slice
-// headers or other overhead and only considers actual image data.
-func (r *Renderer) MemoryUsage() uint64 {
-	var size uint64
+type RendererStatistics struct {
+	UniformsNum    atomic.Uint64
+	TexturesNum    atomic.Uint64
+	CompressedNum  atomic.Uint64
+	CompressedSize atomic.Uint64
+	UnreadyNum     atomic.Uint64
+}
+
+var globalStats RendererStatistics
+var globalUsedBitmap struct {
+	// OPT(dh): having a global lock is obvious awful
+	mu   sync.Mutex
+	bits big.Int
+}
+
+func (stats *RendererStatistics) Add(other *RendererStatistics) {
+	stats.UniformsNum.Add(other.UniformsNum.Load())
+	stats.TexturesNum.Add(other.TexturesNum.Load())
+	stats.CompressedNum.Add(other.CompressedNum.Load())
+	stats.CompressedSize.Add(other.CompressedSize.Load())
+	stats.UnreadyNum.Add(other.UnreadyNum.Load())
+}
+
+func (stats *RendererStatistics) String() string {
+	f := `Uniforms: %d (%f MiB)
+Textures: %d (%f MiB)
+Compressed: %d (%f MiB)
+Not ready/cancelled: %d`
+	return fmt.Sprintf(
+		f,
+		stats.UniformsNum.Load(), float64(stats.UniformsNum.Load()*4)/1024/1024,
+		stats.TexturesNum.Load(), float64(stats.TexturesNum.Load()*texWidth*4)/1024/1024,
+		stats.CompressedNum.Load(), float64(stats.CompressedSize.Load())/1024/1024,
+		stats.UnreadyNum.Load(),
+	)
+}
+
+func (stats *RendererStatistics) Memory() uint64 {
+	return stats.TexturesNum.Load()*texWidth*4 +
+		stats.UniformsNum.Load()*4 +
+		stats.CompressedSize.Load()
+}
+
+func (r *Renderer) Compact(frame uint64) (uint64, uint64) {
+	var n uint64
 	for _, tex := range r.textures {
-		img, _, _ := tex.getNoUse()
-		switch img := img.(type) {
-		case *image.Uniform:
-			size += 4
-		case *image.RGBA:
-			size += uint64(len(img.Pix))
-		case nil:
-		default:
-			panic(fmt.Sprintf("unhandled type %T", img))
+		// TODO(dh): we should probably measure in wall time, not frame time
+		if len(tex.compressed) != 0 || tex.lastUse >= frame-100 || tex.data == nil {
+			continue
 		}
+		data, ok := tex.data.ResultNoWait()
+		if !ok {
+			continue
+		}
+		img, ok := data.image.(*image.RGBA)
+		if !ok {
+			continue
+		}
+
+		buf := bytes.NewBuffer(nil)
+		w, _ := flate.NewWriter(buf, flate.BestSpeed)
+		w.Write(img.Pix)
+		w.Close()
+		tex.compressed = buf.Bytes()
+		// lint:ignore SA6002 We can't actually avoid this allocation. The slice is stored as a non-pointer in
+		// a struct. We don't want to reuse an interior pointer to that struct.
+		pixPool.Put(img.Pix)
+		tex.data = nil
+		globalStats.TexturesNum.Add(^uint64(0))
+		globalStats.CompressedNum.Add(1)
+		globalStats.CompressedSize.Add(uint64(len(tex.compressed)))
+		n++
 	}
-	return size
+	return uint64(len(r.textures)), n
 }
 
 // renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
@@ -388,7 +491,18 @@ func (r *Renderer) renderTexture(win *theme.Window, start trace.Timestamp, nsPer
 			// Simulate a slow renderer.
 			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
 		}
-		return r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
+		data := r.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
+		switch data.image.(type) {
+		case *image.Uniform:
+			globalStats.UniformsNum.Add(1)
+		case *image.RGBA:
+			globalStats.TexturesNum.Add(1)
+		case nil:
+			// Cancelled
+		default:
+			panic(fmt.Sprintf("unexpected type %T", data.image))
+		}
+		return data
 	})
 	return out
 }
@@ -466,7 +580,7 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 			select {
 			case <-cancelled:
 				renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-				return
+				return textureData{}
 			default:
 			}
 		}
@@ -513,7 +627,7 @@ func (r *Renderer) computeTexture(start trace.Timestamp, nsPerPx float64, spans 
 	select {
 	case <-cancelled:
 		renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-		return
+		return textureData{}
 	default:
 	}
 
