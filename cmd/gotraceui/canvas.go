@@ -196,6 +196,8 @@ type Canvas struct {
 
 	timelineWidgetsCache mem.AllocationCache[TimelineWidget]
 	trackWidgetsCache    mem.AllocationCache[TrackWidget]
+
+	usedTextures map[*texture]struct{}
 }
 
 func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
@@ -209,6 +211,7 @@ func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 		debugWindow:    dwin,
 		itemToTimeline: make(map[any]*Timeline),
 		timelines:      make([]*Timeline, 0, len(t.Goroutines)+len(t.Processors)+len(t.Machines)+2),
+		usedTextures:   map[*texture]struct{}{},
 	}
 	cv.timeline.displayAllLabels = true
 	cv.timeline.hoveredSpans = NoItems[ptrace.Span]{}

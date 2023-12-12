@@ -51,6 +51,7 @@ const (
 	debugDisplayGradients = false
 	debugDisplayZoom      = false
 	debugTraceRenderer    = false
+	debugTraceCompaction  = true
 
 	texWidth = 8192
 	// Offset log2(nsPerPx) by this much to ensure it is positive. 16 allows for 1 ns / 64k pixels, which realistically
@@ -61,6 +62,11 @@ const (
 	// texture in O(levels). if we optimized that, we could set logOffset arbitrarily large, e.g. 64. Our data
 	// structures are already sparse in the number of levels.
 	logOffset = 16
+
+	// How many frames to wait between compaction attempts
+	compactInterval = 100
+	// Maximum memory to spend on storing decompressed textures
+	maxTextureMemoryUsage = 100 * 1024 * 1024
 )
 
 // Counter of currently computing textures.
@@ -102,9 +108,9 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(win *theme.Window, ops *op.Ops) (best bool) {
+func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]struct{}) (best bool) {
 	for i, t := range tex.texs {
-		_, imgOp, ok := t.tex.get(win)
+		_, imgOp, ok := t.tex.get(win, used)
 		if !ok {
 			continue
 		}
@@ -137,7 +143,6 @@ func (tex TextureStack) Add(win *theme.Window, ops *op.Ops) (best bool) {
 		paint.PaintOp{}.Add(ops)
 		return i == 0
 	}
-	// We always expect a ready fallback texture to be available.
 	panic("unreachable")
 }
 
@@ -160,68 +165,96 @@ type texture struct {
 	// 15x to 150x. For 8192-wide textures, the increase from 32 KiB to 34 KiB (at a 15x ratio) is only a
 	// 6.25% increase in size. In return for that increase we don't have to spend 500 µs per texture we want
 	// to compress, and we only have to compress a given texture once.
+	data1 *theme.Future[textureData1]
+	data2 *theme.Future[textureData2]
+}
+
+type textureData1 struct {
 	compressed []byte
-	data       *theme.Future[textureData]
+	uniform    *image.Uniform
 }
 
-type textureData struct {
-	computedIn time.Duration
-	image      image.Image
-	op         paint.ImageOp
+type textureData2 struct {
+	image image.Image
+	op    paint.ImageOp
 }
 
-func (tex *texture) get(win *theme.Window) (image.Image, paint.ImageOp, bool) {
+func (tex *texture) get(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
 	tex.lastUse = win.Frame
-	return tex.getNoUse(win)
+	return tex.getNoUse(win, used)
 }
 
-var TOTAL atomic.Uint64
+func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
+	if tex.data2 != nil {
+		if data, ok := tex.data2.ResultNoWait(); ok {
+			if _, ok := data.image.(*image.RGBA); ok {
+				used[tex] = struct{}{}
+			}
+			return data.image, data.op, true
+		} else {
+			used[tex] = struct{}{}
+			return nil, paint.ImageOp{}, false
+		}
+	}
 
-func (tex *texture) getNoUse(win *theme.Window) (image.Image, paint.ImageOp, bool) {
-	if tex.data == nil && len(tex.compressed) > 0 {
-		tex.data = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData {
-			pix := pixPool.Get().([]byte)
-			t := time.Now()
-			r := flate.NewReader(bytes.NewReader(tex.compressed))
-			io.ReadFull(r, pix)
-			if err := r.Close(); err != nil {
-				panic(fmt.Sprintf("error decompressing texture: %s", err))
-			}
-			TOTAL.Add(uint64(time.Since(t)))
-			img := &image.RGBA{
-				Pix:    pix,
-				Stride: 4,
-				Rect:   image.Rect(0, 0, texWidth, 1),
-			}
-			globalStats.RGBANum.Add(1)
-			return textureData{
-				image: img,
-				op:    paint.NewImageOp(img),
-			}
+	if tex.data1 == nil {
+		panic("unreachable")
+	}
+
+	data, ok := tex.data1.ResultNoWait()
+	if !ok {
+		return nil, paint.ImageOp{}, false
+	}
+
+	if data.uniform != nil {
+		op := paint.NewImageOp(data.uniform)
+		globalStats.UniformsNum.Add(1)
+		tex.data2 = theme.Immediate(textureData2{
+			image: data.uniform,
+			op:    op,
 		})
+		return data.uniform, op, true
 	}
 
-	return tex.getNoPopulate()
-}
+	used[tex] = struct{}{}
+	tex.data2 = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData2 {
+		if data.compressed == nil {
+			panic("unreachable")
+		}
 
-func (tex *texture) getNoPopulate() (image.Image, paint.ImageOp, bool) {
-	if tex.data == nil {
-		return nil, paint.ImageOp{}, false
-	}
-	data, ok := tex.data.ResultNoWait()
-	if ok {
-		return data.image, data.op, true
-	} else {
-		return nil, paint.ImageOp{}, false
-	}
+		pix := pixPool.Get().([]byte)
+		r := flate.NewReader(bytes.NewReader(data.compressed))
+		io.ReadFull(r, pix)
+		if err := r.Close(); err != nil {
+			panic(fmt.Sprintf("error decompressing texture: %s", err))
+		}
+		img := &image.RGBA{
+			Pix:    pix,
+			Stride: 4,
+			Rect:   image.Rect(0, 0, texWidth, 1),
+		}
+		globalStats.RGBANum.Add(1)
+		return textureData2{
+			image: img,
+			op:    paint.NewImageOp(img),
+		}
+	})
+
+	return nil, paint.ImageOp{}, false
 }
 
 func (tex *texture) ready() bool {
-	if tex.data == nil {
-		return false
+	if tex.data2 != nil {
+		_, ok := tex.data2.ResultNoWait()
+		return ok
 	}
-	_, ok := tex.data.ResultNoWait()
-	return ok
+
+	if tex.data1 == nil {
+		panic("unreachable")
+	}
+
+	data, ok := tex.data1.ResultNoWait()
+	return ok && data.uniform != nil
 }
 
 func (tex *texture) End() trace.Timestamp {
@@ -305,34 +338,6 @@ func (stats *RendererStatistics) Memory() uint64 {
 	return stats.RGBANum.Load()*texWidth*4 +
 		stats.UniformsNum.Load()*4 +
 		stats.CompressedSize.Load()
-}
-
-func (track *Track) Compact(frame uint64) (uint64, uint64) {
-	r := &track.rnd
-	var n uint64
-	for _, tex := range r.textures {
-		// TODO(dh): we should probably measure in wall time, not frame time
-		if tex.lastUse >= frame-100 || tex.data == nil {
-			continue
-		}
-		data, ok := tex.data.ResultNoWait()
-		if !ok {
-			continue
-		}
-		img, ok := data.image.(*image.RGBA)
-		if !ok {
-			continue
-		}
-
-		// lint:ignore SA6002 We can't actually avoid this allocation. The slice is stored as a non-pointer in
-		// a struct. We don't want to reuse an interior pointer to that struct.
-		pixPool.Put(img.Pix)
-		tex.data = nil
-		globalStats.RGBANum.Add(^uint64(0))
-		n++
-	}
-
-	return uint64(len(r.textures)), n
 }
 
 // renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
@@ -456,7 +461,9 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 			start:   start,
 			nsPerPx: float64(end-start) / texWidth,
 			level:   uint8(logNsPerPx),
-			data: theme.Immediate(textureData{
+			// We don't add to globalStats.UniformsNum here, because this uniform is reused many times without
+			// increasing memory usage.
+			data2: theme.Immediate(textureData2{
 				image: placeholderUniform,
 				op:    placeholderOp,
 			}),
@@ -487,23 +494,34 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
-	tex.data = theme.NewFuture[textureData](win, func(cancelled <-chan struct{}) textureData {
+	tex.data1 = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData1 {
 		if debugSlowRenderer {
 			// Simulate a slow renderer.
 			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
 		}
-		data := track.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
-		switch data.image.(type) {
+		img := track.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
+		switch img := img.(type) {
 		case *image.Uniform:
-			globalStats.UniformsNum.Add(1)
+			return textureData1{
+				uniform: img,
+			}
 		case *image.RGBA:
-			globalStats.RGBANum.Add(1)
+			buf := bytes.NewBuffer(nil)
+			w, _ := flate.NewWriter(buf, flate.BestSpeed)
+			w.Write(img.Pix)
+			w.Close()
+			globalStats.CompressedNum.Add(1)
+			globalStats.CompressedSize.Add(uint64(len(buf.Bytes())))
+			return textureData1{
+				compressed: buf.Bytes(),
+			}
+
 		case nil:
 			// Cancelled
+			return textureData1{}
 		default:
-			panic(fmt.Sprintf("unexpected type %T", data.image))
+			panic(fmt.Sprintf("unexpected type %T", img))
 		}
-		return data
 	})
 	return out
 }
@@ -515,7 +533,7 @@ type pixel struct {
 
 // computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
 // appropriate fields in tex.
-func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) (out textureData) {
+func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) image.Image {
 	// r := &track.rnd
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
@@ -524,11 +542,6 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 
 	// The texture covers the time range [start, end]
 	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
-
-	now := time.Now()
-	defer func() {
-		out.computedIn = time.Since(now)
-	}()
 
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
@@ -582,7 +595,7 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 			select {
 			case <-cancelled:
 				renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-				return textureData{}
+				return nil
 			default:
 			}
 		}
@@ -629,7 +642,7 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 	select {
 	case <-cancelled:
 		renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-		return textureData{}
+		return nil
 	default:
 	}
 
@@ -661,19 +674,7 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 		s[3] = srgb.A
 	}
 
-	buf := bytes.NewBuffer(nil)
-	w, _ := flate.NewWriter(buf, flate.BestSpeed)
-	w.Write(img.Pix)
-	w.Close()
-	// XXX this is racy
-	tex.compressed = buf.Bytes()
-	globalStats.CompressedNum.Add(1)
-	globalStats.CompressedSize.Add(uint64(len(tex.compressed)))
-
-	return textureData{
-		image: img,
-		op:    paint.NewImageOp(img),
-	}
+	return img
 }
 
 // Render returns a series of textures that when placed next to each other will display spans for the time range [start,
@@ -713,7 +714,9 @@ func (track *Track) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx 
 		tex := &texture{
 			start:   newStart,
 			nsPerPx: float64(newEnd-newStart) / texWidth,
-			data: theme.Immediate(textureData{
+			// We don't add to globalStats.UniformsNum here, because this uniform is reused many times without
+			// increasing memory usage.
+			data2: theme.Immediate(textureData2{
 				image: stackPlaceholderUniform,
 				op:    stackPlaceholderOp,
 			}),

@@ -15,6 +15,7 @@ import (
 	"runtime/pprof"
 	rtrace "runtime/trace"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -456,80 +457,103 @@ func displayHighlightSpansDialog(win *theme.Window, filter *Filter) {
 type TimelinesComponent struct {
 	cv *Canvas
 
+	scratch         []*texture
 	compressTlIndex int
 }
 
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	// XXX move all of this code into Canvas.Layout
 
-	TOTAL.Store(0)
+	// Every compactInterval frames, we remove all uninteresting textures from the map of tracked textures. Additionally,
+	// if we've exceeded the memory limit, we will compact the oldest textures (i.e. free their image.Image)
+	// to get to 50% of the limit.
+	//
+	// Clearing uninteresting textures continuously instead of only when we exceed the memory limit lowers the
+	// per-frame latency incurred.
+	//
+	// Note that we don't ever collect uniforms, because it's hardly worth it. Even if we had a million
+	// uniforms, that would only account for 4 MB.
+	if win.Frame%compactInterval == 0 {
+		const maxRGBAs = maxTextureMemoryUsage / (texWidth * 4)
+		rgbas := globalStats.RGBANum.Load()
 
-	if true {
-		if globalStats.Memory() > 100*1024*1024 {
-			// fmt.Println("--- Before ---")
-			// XXX move globalStats to somewhere less global
-			// fmt.Println(&globalStats)
-
-			idx := tlc.compressTlIndex
-			origIdx := idx
-			t := time.Now()
-			var looked, compressed uint64
-			// We only check the elapsed time after each timeline, but timelines can contain many tracks which
-			// contain many textures, and if a lot of them have to be compressed, we can exceed our time limit.
-			//
-			// The alternative, checking after each track, however, spends too much time in runtime.nanotime.
-			for time.Since(t) < 100*time.Microsecond {
-				idx = (idx + 1) % len(tlc.cv.timelines)
-				tl := tlc.cv.timelines[idx]
-				for _, tr := range tl.tracks {
-					a, b := tr.Compact(win.Frame)
-					looked += a
-					compressed += b
-				}
-
-				if idx == origIdx {
-					break
-				}
-			}
-			tlc.compressTlIndex = idx
-
-			// fmt.Println("--- After ---")
-			// // XXX move globalStats to somewhere less global
-			// fmt.Println(&globalStats)
-			// // if n := totalCompressed.Load(); n == 0 {
-			// d := time.Since(t)
-			// fmt.Println("compressed", compressed, "textures, looked at", looked, "in", d)
-			// }
-
-			// XXX it can happen that just the compressed textures take up too much memory, and freeing uncompressed
-			// textures alone won't be enough. but we never really know if we're in that state, because we'd have to look at
-			// all textures in one go, instead of incrementally.
-
-		}
-	}
-
-	if false {
-		if win.Frame%1000 == 0 {
-			fmt.Println("--- Stats ---")
+		collect := rgbas > maxRGBAs
+		var (
+			t             time.Time
+			n             int
+			uninteresting int
+			compacted     int
+		)
+		if debugTraceCompaction {
+			fmt.Println("--- Before ---")
 			fmt.Println(&globalStats)
+			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
+
+			t = time.Now()
+			n = len(tlc.cv.usedTextures)
 		}
-	}
-	if false {
-		var d time.Duration
-		var n int
-		for _, tl := range tlc.cv.timelines {
-			for _, tr := range tl.tracks {
-				for _, tex := range tr.rnd.textures {
-					data, ok := tex.data.ResultNoWait()
-					if ok {
-						d += data.computedIn
-						n++
-					}
-				}
+
+		todo := int(rgbas - maxRGBAs)
+
+		var texs []*texture
+		if collect {
+			texs = tlc.scratch[:0]
+			if cap(texs) < len(tlc.cv.usedTextures) {
+				texs = make([]*texture, 0, len(tlc.cv.usedTextures))
+				tlc.scratch = texs
 			}
 		}
-		if n != 0 {
-			fmt.Println(d / time.Duration(n))
+		// Stop tracking textures that aren't worth tracking (uniforms and unloaded textures), and collect
+		// the rest.
+		for tex := range tlc.cv.usedTextures {
+			if tex.data2 == nil {
+				delete(tlc.cv.usedTextures, tex)
+				uninteresting++
+				continue
+			}
+			res, ok := tex.data2.ResultNoWait()
+			if !ok {
+				continue
+			}
+			if _, ok := res.image.(*image.RGBA); !ok {
+				panic(fmt.Sprintf("%T", res.image))
+				delete(tlc.cv.usedTextures, tex)
+				uninteresting++
+				continue
+			}
+			if collect {
+				texs = append(texs, tex)
+			}
+		}
+
+		if collect {
+			// Sort remaining textures by last use
+			sort.Slice(texs, func(i, j int) bool {
+				return texs[i].lastUse < texs[j].lastUse
+			})
+			// Compact todo oldest textures
+			todo = min(todo, len(texs))
+			for _, tex := range texs[:todo] {
+				res, ok := tex.data2.ResultNoWait()
+				if !ok {
+					panic("impossible")
+				}
+				if _, ok := res.image.(*image.RGBA); !ok {
+					panic("impossible")
+				}
+				tex.data2 = nil
+				delete(tlc.cv.usedTextures, tex)
+				compacted++
+			}
+			globalStats.RGBANum.Add(uint64(-todo))
+		}
+
+		if debugTraceCompaction {
+			d := time.Since(t)
+			fmt.Println("--- After ---")
+			fmt.Println(&globalStats)
+			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
+			fmt.Printf("Inspected %d textures, removed %d uninteresting ones, compacted %d, in %s\n", n, uninteresting, compacted, d)
 		}
 	}
 
@@ -539,13 +563,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		}
 	}
 
-	ret := tlc.cv.Layout(win, gtx)
-
-	if n := TOTAL.Load(); n != 0 {
-		log.Println(time.Duration(n))
-	}
-
-	return ret
+	return tlc.cv.Layout(win, gtx)
 }
 
 func (tlc *TimelinesComponent) Title() string {
