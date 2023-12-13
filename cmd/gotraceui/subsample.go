@@ -559,6 +559,9 @@ func computeTexture(tex *texture) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, texWidth, 1))
 	// Cache the conversion of the final pixel colors to sRGB.
 	srgbCache := map[color.LinearSRGB]stdcolor.RGBA{}
+	firstSet := false
+	allSame := true
+	var firstColor stdcolor.RGBA
 	for x := range pixels {
 		px := &pixels[x]
 		px.sum.A = 1
@@ -578,10 +581,23 @@ func computeTexture(tex *texture) image.Image {
 		}
 		i := img.PixOffset(x, 0)
 		s := img.Pix[i : i+4 : i+4] // Small cap improves performance, see https://golang.org/issue/27857
+		if firstSet {
+			if firstColor != srgb {
+				allSame = false
+			}
+		} else {
+			firstSet = true
+			firstColor = srgb
+		}
 		s[0] = srgb.R
 		s[1] = srgb.G
 		s[2] = srgb.B
 		s[3] = srgb.A
+	}
+
+	// Turn single-color textures into uniforms. That's a compression ratio of texWidth.
+	if allSame {
+		return image.NewUniform(firstColor)
 	}
 
 	return img
