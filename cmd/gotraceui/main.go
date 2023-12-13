@@ -565,7 +565,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		fmt.Println(&tlc.cv.textures.Stats)
 	}
 
-	if true {
+	if false {
 		if n := debugTexturesComputing.Load(); n != 0 {
 			fmt.Printf("Computing %d textures\n", n)
 		}

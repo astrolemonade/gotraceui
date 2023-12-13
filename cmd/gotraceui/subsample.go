@@ -36,6 +36,7 @@ import (
 	"honnef.co/go/gotraceui/mysync"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace"
+	"honnef.co/go/gotraceui/trace/ptrace"
 
 	"gioui.org/f32"
 	"gioui.org/op"
@@ -80,9 +81,9 @@ var pixelsPool = &sync.Pool{
 	},
 }
 
-var pixPool = &sync.Pool{
+var flateWriterPool = &sync.Pool{
 	New: func() any {
-		return make([]uint8, texWidth*4)
+		return (*flate.Writer)(nil)
 	},
 }
 
@@ -151,6 +152,10 @@ func (tex TextureStack) Add(win *theme.Window, tm *TextureManager, tr *Trace, op
 
 type texture struct {
 	track *Track
+	// We cannot use track.spans because that might change between planning and computing textures. For example, CPU
+	// sampling tracks get niled out when the widget scrolls out of view. We don't want to handle nil spans and
+	// not-yet-ready spans and risk restarting futures in several places.
+	spans Items[ptrace.Span]
 	start trace.Timestamp
 	// The texture's effective nsPerPx. When rendering a texture for a given nsPerPx, its XScale should be nsPerPx /
 	// texture.nsPerPx.
@@ -159,18 +164,20 @@ type texture struct {
 	// Last frame this texture was used in
 	lastUse uint64
 
+	computed textureComputed
+	realized textureRealized
+
 	// The texture's zoom level, which is the log2 of the original nsPerPx, which may differ from the texture's
 	// effective nsPerPx.
 	level uint8
 
-	computed textureComputed
-	realized textureRealized
-	tracked  bool
+	tracked bool
 	// This is an ephemeral texture that isn't tracked in any caches, returned only to hold a uniform.
 	ephemeral bool
 }
 
 type textureComputed struct {
+	done       chan struct{}
 	computedIn time.Duration
 	// Compressed stores the compressed version of the texture. This is always populated for image.RGBA-backed
 	// textures once computing it has finished. That is, we don't compress textures on demand. The average
@@ -180,13 +187,12 @@ type textureComputed struct {
 	// to compress, and we only have to compress a given texture once.
 	compressed []byte
 	uniform    *image.Uniform
-	done       chan struct{}
 }
 
 type textureRealized struct {
+	done  chan struct{}
 	image image.Image
 	op    paint.ImageOp
-	done  chan struct{}
 }
 
 func (tex *texture) ready() bool {
@@ -268,13 +274,12 @@ Compressed RGBAs: %d (%f MiB, %f MiB uncompressed)`
 func (r *Renderer) planTextures(
 	win *theme.Window,
 	track *Track,
+	spans Items[ptrace.Span],
 	start trace.Timestamp,
 	nsPerPx float64,
 	out []*texture,
 ) []*texture {
 	renderTrace("  planning texture at %d ns @ %f ns/px for track in %q", start, nsPerPx, track.parent.shortName)
-
-	spans := track.spans.MustResult()
 
 	if spans.Len() == 0 {
 		renderTrace("    no spans to plan")
@@ -396,6 +401,7 @@ func (r *Renderer) planTextures(
 		// OPT(dh): avoiding this allocation would be nice
 		placeholderTex := instantUniform(&texture{
 			track:     track,
+			spans:     spans,
 			start:     start,
 			nsPerPx:   float64(end-start) / texWidth,
 			level:     uint8(logNsPerPx),
@@ -412,13 +418,11 @@ func (r *Renderer) planTextures(
 	}
 
 	if tex != nil {
-		if tex.computed.done != nil {
-			panic("unreachable")
-		}
 		renderTrace("    exact match had its computed data deleted")
 	} else {
 		tex = &texture{
 			track:   track,
+			spans:   spans,
 			start:   start,
 			nsPerPx: nsPerPx,
 			level:   uint8(logNsPerPx),
@@ -448,17 +452,16 @@ func computeTexture(tex *texture) image.Image {
 
 	// The texture covers the time range [start, end]
 	end := trace.Timestamp(math.Ceil(float64(tex.start) + tex.nsPerPx*texWidth))
-	spans := tex.track.spans.MustResult()
 
 	if tex.nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}
 
-	first := sort.Search(spans.Len(), func(i int) bool {
-		return spans.At(i).End >= tex.start
+	first := sort.Search(tex.spans.Len(), func(i int) bool {
+		return tex.spans.At(i).End >= tex.start
 	})
-	last := sort.Search(spans.Len(), func(i int) bool {
-		return spans.At(i).Start >= end
+	last := sort.Search(tex.spans.Len(), func(i int) bool {
+		return tex.spans.At(i).Start >= end
 	})
 
 	pixelsPtr := pixelsPool.Get().(*[]pixel)
@@ -506,7 +509,7 @@ func computeTexture(tex *texture) image.Image {
 			default:
 			}
 		}
-		span := spans.At(i)
+		span := tex.spans.At(i)
 
 		firstBucket := float64(span.Start-tex.start) / tex.nsPerPx
 		lastBucket := float64(span.End-tex.start) / tex.nsPerPx
@@ -521,7 +524,7 @@ func computeTexture(tex *texture) image.Image {
 		firstBucket = max(firstBucket, 0)
 		lastBucket = min(lastBucket, texWidth)
 
-		colorIdx := tex.track.SpanColor(spans.At(i), tex.track.parent.cv.trace)
+		colorIdx := tex.track.SpanColor(tex.spans.At(i), tex.track.parent.cv.trace)
 		c := mappedColors[colorIdx]
 
 		if int(firstBucket) == int(lastBucket) {
@@ -590,12 +593,12 @@ func computeTexture(tex *texture) image.Image {
 func (r *Renderer) Render(
 	win *theme.Window,
 	track *Track,
+	spans Items[ptrace.Span],
 	nsPerPx float64,
 	start trace.Timestamp,
 	end trace.Timestamp,
 	out []TextureStack,
 ) []TextureStack {
-	spans := track.spans.MustResult()
 	if c, ok := spans.Container(); ok {
 		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px in a track in timeline %q", start, end, nsPerPx, c.Timeline.shortName)
 	} else {
@@ -624,6 +627,7 @@ func (r *Renderer) Render(
 		// OPT(dh): avoiding this allocation would be nice
 		tex := instantUniform(&texture{
 			track:     track,
+			spans:     spans,
 			start:     newStart,
 			nsPerPx:   float64(newEnd-newStart) / texWidth,
 			level:     uint8(math.Log2(nsPerPx)),
@@ -679,7 +683,7 @@ func (r *Renderer) Render(
 	}
 	texs := r.texsOut
 	for start := start; start < end; start += step {
-		texs = r.planTextures(win, track, start, nsPerPx, texs[:0])
+		texs = r.planTextures(win, track, spans, start, nsPerPx, texs[:0])
 
 		var texs2 []Texture
 		for _, tex := range texs {
@@ -713,12 +717,13 @@ type TextureManager struct {
 func (tm *TextureManager) Render(
 	win *theme.Window,
 	track *Track,
+	spans Items[ptrace.Span],
 	nsPerPx float64,
 	start trace.Timestamp,
 	end trace.Timestamp,
 	out []TextureStack,
 ) []TextureStack {
-	return track.rnd.Render(win, track, nsPerPx, start, end, out)
+	return track.rnd.Render(win, track, spans, nsPerPx, start, end, out)
 }
 
 func (tm *TextureManager) Image(win *theme.Window, tr *Trace, tex *texture) (image.Image, paint.ImageOp, bool) {
@@ -737,14 +742,6 @@ func (tm *TextureManager) Image(win *theme.Window, tr *Trace, tex *texture) (ima
 func (tm *TextureManager) uncompute(texs []*texture) {
 	var sz int
 	for _, tex := range texs {
-		// OPT(dh): remove this safety check
-		if !CanRecv(tex.computed.done) {
-			panic("unreachable")
-		}
-		if tex.computed.compressed == nil {
-			panic("unreachable")
-		}
-
 		sz += len(tex.computed.compressed)
 		tex.computed = textureComputed{}
 	}
@@ -757,10 +754,6 @@ func (tm *TextureManager) unrealize(texs []*texture) {
 	s, unlock := tm.realizedRGBAs.Lock()
 	defer unlock.Unlock()
 	for _, tex := range texs {
-		// OPT(dh): remove this safety check
-		if !CanRecv(tex.realized.done) {
-			panic("unreachable")
-		}
 		tex.realized = textureRealized{}
 		s.Delete(tex)
 	}
@@ -798,7 +791,7 @@ func (tm *TextureManager) realize(tex *texture, tr *Trace) {
 				tm.Stats.RealizedUniforms.Add(1)
 			}
 		} else {
-			pix := pixPool.Get().([]byte)
+			pix := make([]byte, texWidth*4)
 			r := flate.NewReader(bytes.NewReader(tex.computed.compressed))
 			io.ReadFull(r, pix)
 			if err := r.Close(); err != nil {
@@ -844,8 +837,15 @@ func (tm *TextureManager) compute(tex *texture, tr *Trace) {
 		case *image.RGBA:
 			buf := bytes.NewBuffer(nil)
 			// We benchmarked planar RLE vs packed DEFLATE. Compression, RLE was slightly faster at worse compression.
-			// Decompression, DEFLATE was 3x faster.
-			w, _ := flate.NewWriter(buf, flate.BestSpeed)
+			// Decompression, DEFLATE was 3x faster. However, compress/flate allocates significant amounts of memory in
+			// flate.NewReader, so this might be worth reconsidering.
+			w := flateWriterPool.Get().(*flate.Writer)
+			if w == nil {
+				w, _ = flate.NewWriter(buf, flate.BestSpeed)
+			} else {
+				w.Reset(buf)
+			}
+			defer flateWriterPool.Put(w)
 			w.Write(img.Pix)
 			w.Close()
 			tex.computed.compressed = buf.Bytes()

@@ -999,7 +999,7 @@ func (track *Track) Layout(
 	if !debugNewTexture {
 		// OPT(dh): reuse slice between frames
 		var texs []TextureStack
-		texs = track.rnd.Render(win, track, cv.nsPerPx, cv.start, cv.End(), texs)
+		texs = track.rnd.Render(win, track, spans, cv.nsPerPx, cv.start, cv.End(), texs)
 		for _, tex := range texs {
 			if !tex.Add(win, &cv.textures, tr, gtx.Ops) {
 				track.widget.lowQualityRender = true
