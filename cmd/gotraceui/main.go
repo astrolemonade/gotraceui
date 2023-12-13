@@ -464,62 +464,29 @@ type TimelinesComponent struct {
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	// XXX move all of this code into Canvas.Layout
 
-	var newTextures map[*texture]struct{}
-	for tex := range newTextures {
-		if tex.computed.Cancelled() {
-			// Try to avoid restarting cancelled textures. There's still a race between us checking Cancelled
-			// and us calling ResultNoWait, but this is better than always causing a restart.
-			delete(newTextures, tex)
-		}
-		data, ok := tex.computed.ResultNoWait()
-		if !ok {
-			continue
-		}
-		if len(data.compressed) != 0 {
-			globalStats.CompressedNum.Add(1)
-			globalStats.CompressedSize.Add(uint64(len(data.compressed)))
-			addedTotal.Add(uint64(len(data.compressed)))
-		}
-		// XXX allTextures no longer needs a lock
-		if !tex.added {
-			tex.added = true
-			a, unlock := allTextures.Lock()
-			a.Insert(costSortedTexture{tex}, struct{}{})
-			totalInserted.Add(1)
-			unlock.Unlock()
-		}
-		delete(newTextures, tex)
-	}
-
 	// Every compactInterval we check the size of all textures and compressed data. If they exceed their
 	// limits, we delete the least frequently used textures and the cheapest to recompute compressed textures
 	// until we are under 50% of the respective limits again.
 	//
 	// Note that we don't ever collect uniforms, because it's hardly worth it. Even if we had a million
 	// uniforms, that would only account for 4 MB.
+	tm := &tlc.cv.textures
 	if win.Frame%compactInterval == 0 {
 		var (
-			numRGBAs       = globalStats.RGBANum.Load()
+			numRGBAs       = tm.Stats.RealizedRGBAs.Load()
 			sizeRGBAs      = uint64(numRGBAs) * texWidth * 4
-			sizeCompressed = globalStats.CompressedSize.Load()
+			sizeCompressed = tm.Stats.CompressedSize.Load()
 
 			// The following variables are used for debug logging
 			t                     time.Time
-			n                     int
 			deletedCompressedSize int
 			deletedRGBANum        int
 		)
 		active := sizeRGBAs > maxRGBAMemoryUsage || sizeCompressed > maxCompressedMemoryUsage
 		if active && debugTextureCompaction {
 			fmt.Println("--- Before ---")
-			fmt.Println(&globalStats)
-			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-			at, unlock := tlc.cv.allTextures.RLock()
-			fmt.Println("All textures:", at.NumValues)
-			unlock.RUnlock()
-
+			fmt.Println(&tm.Stats)
 			t = time.Now()
-			n = len(tlc.cv.usedTextures)
 		}
 
 		if sizeRGBAs > maxRGBAMemoryUsage {
@@ -529,110 +496,73 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			}
 
 			texs := tlc.scratch[:0]
-			if cap(texs) < len(tlc.cv.usedTextures) {
-				texs = make([]*texture, 0, len(tlc.cv.usedTextures))
+			rgbas, unlock := tm.realizedRGBAs.RLock()
+			if cap(texs) < len(rgbas) {
+				texs = make([]*texture, 0, len(rgbas))
 				tlc.scratch = texs
 			}
 
 			// usedTextures only contains those textures that have their data2 set, which is only the case
 			// if it has or is loading an RGBA texture. No uninteresting textures make it into the map.
-			for tex := range tlc.cv.usedTextures {
+			for tex := range rgbas {
 				texs = append(texs, tex)
 			}
+			unlock.RUnlock()
 			sort.Slice(texs, func(i, j int) bool {
 				return texs[i].lastUse < texs[j].lastUse
 			})
 			todo = min(todo, len(texs))
-			for _, tex := range texs[:todo] {
-				tex.realized = nil
-				delete(tlc.cv.usedTextures, tex)
-			}
-			globalStats.RGBANum.Add(uint64(-todo))
+			tm.unrealize(texs[:todo])
 			deletedRGBANum = todo
 		}
 
-		unready := 0
-		wasNil := 0
-		used := 0
+		deletedCompressedNum := 0
 		if sizeCompressed > maxCompressedMemoryUsage {
 			remaining := int(sizeCompressed - maxCompressedMemoryUsage/2)
 			if debugTextureCompaction {
 				fmt.Println("Need to collect", float64(remaining)/1024/1024, "MiB compressed data")
 			}
 
-			at, unlock := tlc.cv.allTextures.RLock()
+			at, unlock := tm.rgbas.RLock()
 			lookedAt := 0
-			at.Inorder(func(cst costSortedTexture, s struct{}) bool {
+			remove := tlc.scratch[:0]
+			at.Inorder(func(d comparableTimeDuration, tex *texture) bool {
 				if remaining <= 0 {
 					return false
 				}
 				lookedAt++
-				if cst.tex.computed == nil {
-					// This happens if the compressed texture has already been deleted and not yet
-					// recreated.
-					wasNil++
+				if !CanRecv(tex.computed.done) {
+					// The compressed data has already been deleted, and is either still gone, or in the
+					// process of being recomputed.
 					return true
 				}
-				_, ok := cst.tex.computed.ResultNoWait()
-				if !ok {
-					unready++
-					// This happens if the compressed texture has been deleted and is in the process of being
-					// recreated, or due to the race between the tex.computed future updating allTextures and
-					// the future returning and being marked as ready.
-					return true
-				}
-				used++
-				sz := len(cst.tex.computed.MustResult().compressed)
+				sz := len(tex.computed.compressed)
 				remaining -= sz
-				cst.tex.computed = nil
-				// OPT(dh): batch stats updates
 				deletedCompressedSize += sz
-				globalStats.CompressedNum.Add(^uint64(0))
-				globalStats.CompressedSize.Add(uint64(-sz))
-				removedTotal.Add(uint64(sz))
+				remove = append(remove, tex)
 				return true
 			})
 			unlock.RUnlock()
-		}
 
-		fullPassNonNil := 0
-		for _, tl := range tlc.cv.timelines {
-			for _, track := range tl.tracks {
-				for _, tex := range track.rnd.textures {
-					if tex.computed != nil {
-						fullPassNonNil++
-					}
-				}
-			}
+			deletedCompressedNum = len(remove)
+			tm.uncompute(remove)
+			tlc.scratch = remove[:0]
 		}
 
 		if active && debugTextureCompaction {
 			d := time.Since(t)
 			fmt.Println("--- After ---")
-			fmt.Println(&globalStats)
-			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-			at, unlock := tlc.cv.allTextures.RLock()
-			fmt.Println("All textures:", at.NumValues)
-			unlock.RUnlock()
-			fmt.Printf("Inspected %d textures, compacted %d, in %s\n", n, deletedRGBANum, d)
-			fmt.Printf("Deleted %d (%f MiB) compressed\n", used, float64(deletedCompressedSize)/1024/1024)
-			fmt.Printf("%d compressed weren't ready\n", unready)
-			fmt.Printf("%d compressed were nil\n", wasNil)
-			fmt.Printf("%d added, %d removed\n", addedTotal.Load(), removedTotal.Load())
-			fmt.Printf("%d full pass non-nil\n", fullPassNonNil)
-			fmt.Printf("We think we inserted %d textures\n", totalInserted.Load())
+			fmt.Println(&tm.Stats)
+			fmt.Printf("Compacted %d textures in %s\n", deletedRGBANum, d)
+			fmt.Printf("Deleted %d (%f MiB) compressed\n", deletedCompressedNum, float64(deletedCompressedSize)/1024/1024)
 		}
 	}
 
 	// +1 to avoid firing on the same frame as compaction
-	if debugTextureCompaction && (win.Frame%compactInterval+1)*10 == 0 {
-		// Print regularly memory statistics
+	if debugTextureCompaction && ((win.Frame+1)%compactInterval)*10 == 0 {
+		// Regularly print memory statistics
 		fmt.Println("--- Stats ---")
-		fmt.Println(&globalStats)
-		fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-		at, unlock := tlc.cv.allTextures.RLock()
-		fmt.Println("All textures:", at.NumValues)
-		unlock.RUnlock()
+		fmt.Println(&tlc.cv.textures.Stats)
 	}
 
 	if true {
@@ -2119,6 +2049,35 @@ func cmp[T constraints.Ordered](a, b T, negate bool) int {
 	return ret
 }
 
-type TrackedTextures = container.RBTree[costSortedTexture, struct{}]
+// type TrackedTextures = container.RBTree[costSortedTexture, struct{}]
 
-type Set[T any] map[T]struct{}
+type Set[T comparable] map[T]struct{}
+
+func (set Set[T]) Add(v T) {
+	set[v] = struct{}{}
+}
+
+func (set Set[T]) Delete(v T) {
+	delete(set, v)
+}
+
+func CanRecv[T any](ch <-chan T) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func makeClosedChan[T any]() chan T {
+	ch := make(chan T)
+	close(ch)
+	return ch
+}
+
+type comparableTimeDuration time.Duration
+
+func (d1 comparableTimeDuration) Compare(d2 comparableTimeDuration) int {
+	return cmp(d1, d2, false)
+}

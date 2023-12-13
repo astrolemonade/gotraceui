@@ -1,5 +1,7 @@
 package main
 
+// OPT cancel textures
+
 // TODO ahead of time generation of textures. when we request the texture for a zoom level, also generate the next zoom
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
 // and right.
@@ -21,7 +23,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/big"
 	"math/rand"
 	"slices"
 	"sort"
@@ -31,10 +32,10 @@ import (
 
 	"honnef.co/go/gotraceui/clip"
 	"honnef.co/go/gotraceui/color"
+	"honnef.co/go/gotraceui/container"
 	"honnef.co/go/gotraceui/mysync"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace"
-	"honnef.co/go/gotraceui/trace/ptrace"
 
 	"gioui.org/f32"
 	"gioui.org/op"
@@ -47,7 +48,7 @@ const (
 	debugDisplayGradients  = false
 	debugDisplayZoom       = false
 	debugTraceRenderer     = false
-	debugTextureCompaction = true
+	debugTextureCompaction = false
 
 	texWidth = 8192
 	// Offset log2(nsPerPx) by this much to ensure it is positive. 16 allows for 1 ns / 64k pixels, which realistically
@@ -60,12 +61,11 @@ const (
 	logOffset = 16
 
 	// How many frames to wait between compaction attempts
-	compactInterval = 10
+	compactInterval = 100
 	// Maximum memory to spend on storing textures
-	maxTextureMemoryUsage = 1 * 1024 * 1024
+	maxTextureMemoryUsage = 100 * 1024 * 1024
 	// 10% for compressed textures
-	// maxCompressedMemoryUsage = maxTextureMemoryUsage / 10
-	maxCompressedMemoryUsage = 0
+	maxCompressedMemoryUsage = maxTextureMemoryUsage / 10
 	// the remainder for decompressed textures
 	maxRGBAMemoryUsage = maxTextureMemoryUsage - maxCompressedMemoryUsage
 )
@@ -85,6 +85,8 @@ var pixPool = &sync.Pool{
 		return make([]uint8, texWidth*4)
 	},
 }
+
+var closedDoneChannel = makeClosedChan[struct{}]()
 
 var (
 	stackPlaceholderUniform = image.NewUniform(colors[colorStatePlaceholderStackSpan].NRGBA())
@@ -109,9 +111,9 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]struct{}) (best bool) {
+func (tex TextureStack) Add(win *theme.Window, tm *TextureManager, tr *Trace, ops *op.Ops) (best bool) {
 	for i, t := range tex.texs {
-		_, imgOp, ok := t.tex.get(win, used)
+		_, imgOp, ok := tm.Image(win, tr, t.tex)
 		if !ok {
 			continue
 		}
@@ -148,6 +150,7 @@ func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]st
 }
 
 type texture struct {
+	track *Track
 	start trace.Timestamp
 	// The texture's effective nsPerPx. When rendering a texture for a given nsPerPx, its XScale should be nsPerPx /
 	// texture.nsPerPx.
@@ -160,106 +163,37 @@ type texture struct {
 	// effective nsPerPx.
 	level uint8
 
-	computedIn atomic.Uint64
+	computed textureComputed
+	realized textureRealized
+	tracked  bool
+	// This is an ephemeral texture that isn't tracked in any caches, returned only to hold a uniform.
+	ephemeral bool
+}
 
+type textureComputed struct {
+	computedIn time.Duration
 	// Compressed stores the compressed version of the texture. This is always populated for image.RGBA-backed
 	// textures once computing it has finished. That is, we don't compress textures on demand. The average
 	// compression ratio depends on the shape of the trace and the zoom level, but seems to be anywhere around
 	// 15x to 150x. For 8192-wide textures, the increase from 32 KiB to 34 KiB (at a 15x ratio) is only a
 	// 6.25% increase in size. In return for that increase we don't have to spend 500 µs per texture we want
 	// to compress, and we only have to compress a given texture once.
-	computed *theme.Future[textureCompressed]
-	realized *theme.Future[textureRealized]
-
-	added bool
-}
-
-type textureCompressed struct {
 	compressed []byte
 	uniform    *image.Uniform
+	done       chan struct{}
 }
 
 type textureRealized struct {
 	image image.Image
 	op    paint.ImageOp
-}
-
-func (tex *texture) get(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
-	tex.lastUse = win.Frame
-	return tex.getNoUse(win, used)
-}
-
-func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
-	if tex.realized != nil {
-		if data, ok := tex.realized.ResultNoWait(); ok {
-			if _, ok := data.image.(*image.RGBA); ok {
-				used[tex] = struct{}{}
-			}
-			return data.image, data.op, true
-		} else {
-			used[tex] = struct{}{}
-			return nil, paint.ImageOp{}, false
-		}
-	}
-
-	if tex.computed == nil {
-		panic("unreachable")
-	}
-
-	data, ok := tex.computed.ResultNoWait()
-	if !ok {
-		return nil, paint.ImageOp{}, false
-	}
-
-	if data.uniform != nil {
-		op := paint.NewImageOp(data.uniform)
-		globalStats.UniformsNum.Add(1)
-		tex.realized = theme.Immediate(textureRealized{
-			image: data.uniform,
-			op:    op,
-		})
-		return data.uniform, op, true
-	}
-
-	used[tex] = struct{}{}
-	tex.realized = theme.NewFuture(win, func(cancelled <-chan struct{}) textureRealized {
-		if data.compressed == nil {
-			panic("unreachable")
-		}
-
-		pix := pixPool.Get().([]byte)
-		r := flate.NewReader(bytes.NewReader(data.compressed))
-		io.ReadFull(r, pix)
-		if err := r.Close(); err != nil {
-			panic(fmt.Sprintf("error decompressing texture: %s", err))
-		}
-		img := &image.RGBA{
-			Pix:    pix,
-			Stride: 4,
-			Rect:   image.Rect(0, 0, texWidth, 1),
-		}
-		globalStats.RGBANum.Add(1)
-		return textureRealized{
-			image: img,
-			op:    paint.NewImageOp(img),
-		}
-	})
-
-	return nil, paint.ImageOp{}, false
+	done  chan struct{}
 }
 
 func (tex *texture) ready() bool {
-	if tex.realized != nil {
-		_, ok := tex.realized.ResultNoWait()
-		return ok
+	if tex.realized.done != nil {
+		return CanRecv(tex.realized.done)
 	}
-
-	if tex.computed == nil {
-		panic("unreachable")
-	}
-
-	data, ok := tex.computed.ResultNoWait()
-	return ok && data.uniform != nil
+	return CanRecv(tex.computed.done) && tex.computed.uniform != nil
 }
 
 func (tex *texture) End() trace.Timestamp {
@@ -304,56 +238,46 @@ func texturesForLevel(texs []*texture, level int) []*texture {
 }
 
 type RendererStatistics struct {
-	UniformsNum    atomic.Uint64
-	RGBANum        atomic.Uint64
-	CompressedNum  atomic.Uint64
-	CompressedSize atomic.Uint64
+	RealizedUniforms atomic.Uint64
+	RealizedRGBAs    atomic.Uint64
+	CompressedNum    atomic.Uint64
+	CompressedSize   atomic.Uint64
 }
-
-var globalStats RendererStatistics
-var globalUsedBitmap struct {
-	// OPT(dh): having a global lock is obvious awful
-	mu   sync.Mutex
-	bits big.Int
-}
-
-// func (stats *RendererStatistics) Add(other *RendererStatistics) {
-// 	stats.UniformsNum.Add(other.UniformsNum.Load())
-// 	stats.RGBANum.Add(other.RGBANum.Load())
-// 	stats.CompressedSize.Add(other.CompressedSize.Load())
-// }
 
 func (stats *RendererStatistics) String() string {
-	f := `Uniforms: %d (%f MiB)
-RGBAs: %d (%f MiB)
-Compressed: %d (%f MiB, %f MiB uncompressed)`
+	var (
+		uniforms       = stats.RealizedUniforms.Load()
+		rgbas          = stats.RealizedRGBAs.Load()
+		compressedNum  = stats.CompressedNum.Load()
+		compressedSize = stats.CompressedSize.Load()
+	)
+	f := `Realized uniforms: %d (%f MiB)
+Realized RGBAs: %d (%f MiB)
+Compressed RGBAs: %d (%f MiB, %f MiB uncompressed)`
 	return fmt.Sprintf(
 		f,
-		stats.UniformsNum.Load(), float64(stats.UniformsNum.Load()*4)/1024/1024,
-		stats.RGBANum.Load(), float64(stats.RGBANum.Load()*texWidth*4)/1024/1024,
-		stats.CompressedNum.Load(), float64(stats.CompressedSize.Load())/1024/1024, float64(stats.CompressedNum.Load()*texWidth*4)/1024/1024,
+		uniforms, float64(uniforms*4)/1024/1024,
+		rgbas, float64(rgbas*texWidth*4)/1024/1024,
+		compressedNum, float64(compressedSize)/1024/1024, float64(stats.CompressedNum.Load()*texWidth*4)/1024/1024,
 	)
 }
 
-// renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
+// planTextures returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
 // textures at different zoom levels, sorted by zoom level in descending order. That is, the first texture has the
 // highest resolution.
-func (track *Track) renderTexture(
+func (r *Renderer) planTextures(
 	win *theme.Window,
+	track *Track,
 	start trace.Timestamp,
 	nsPerPx float64,
-	spans Items[ptrace.Span],
-	tr *Trace,
-	spanColor func(ptrace.Span, *Trace) colorIndex,
 	out []*texture,
-	newTextures map[*texture]struct{},
-	allTextures *mysync.Mutex[*TrackedTextures],
 ) []*texture {
-	r := &track.rnd
-	renderTrace("  rendering texture at %d ns @ %f ns/px", start, nsPerPx)
+	renderTrace("  planning texture at %d ns @ %f ns/px for track in %q", start, nsPerPx, track.parent.shortName)
+
+	spans := track.spans.MustResult()
 
 	if spans.Len() == 0 {
-		renderTrace("    no spans to render")
+		renderTrace("    no spans to plan")
 		return out
 	}
 
@@ -386,9 +310,10 @@ func (track *Track) renderTexture(
 			}
 		}
 	}
-	foundExact := tex != nil && (tex.computed != nil || tex.realized != nil)
+	// XXX add method that encapsulates tex.computed.done != nil
+	foundExact := tex != nil && tex.computed.done != nil
 
-	if tex != nil && (tex.computed != nil || tex.realized != nil) {
+	if tex != nil && (tex.computed.done != nil) {
 		out = append(out, tex)
 
 		if tex.ready() {
@@ -415,7 +340,7 @@ func (track *Track) renderTexture(
 			continue
 		}
 		f := textures[n]
-		if f.computed == nil && f.realized == nil {
+		if f.computed.done == nil {
 			continue
 		}
 		if f.start <= start {
@@ -451,7 +376,7 @@ func (track *Track) renderTexture(
 			continue
 		}
 		f := textures[n]
-		if f.computed == nil && f.realized == nil {
+		if f.computed.done == nil {
 			continue
 		}
 		if f.start <= start {
@@ -468,17 +393,14 @@ func (track *Track) renderTexture(
 	renderTrace("    found %d lower resolution textures", foundLower)
 
 	{
-		placeholderTex := &texture{
-			start:   start,
-			nsPerPx: float64(end-start) / texWidth,
-			level:   uint8(logNsPerPx),
-			// We don't add to globalStats.UniformsNum here, because this uniform is reused many times without
-			// increasing memory usage.
-			realized: theme.Immediate(textureRealized{
-				image: placeholderUniform,
-				op:    placeholderOp,
-			}),
-		}
+		// OPT(dh): avoiding this allocation would be nice
+		placeholderTex := instantUniform(&texture{
+			track:     track,
+			start:     start,
+			nsPerPx:   float64(end-start) / texWidth,
+			level:     uint8(logNsPerPx),
+			ephemeral: true,
+		}, placeholderUniform, placeholderOp)
 		out = append(out, placeholderTex)
 	}
 
@@ -490,12 +412,13 @@ func (track *Track) renderTexture(
 	}
 
 	if tex != nil {
-		if tex.computed != nil {
+		if tex.computed.done != nil {
 			panic("unreachable")
 		}
-		renderTrace("    exact match had its compressed data deleted, recomputing")
+		renderTrace("    exact match had its computed data deleted")
 	} else {
 		tex = &texture{
+			track:   track,
 			start:   start,
 			nsPerPx: nsPerPx,
 			level:   uint8(logNsPerPx),
@@ -508,36 +431,6 @@ func (track *Track) renderTexture(
 	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
-	newTextures[tex] = struct{}{}
-	tex.computed = theme.NewFuture(win, func(cancelled <-chan struct{}) textureCompressed {
-		if debugSlowRenderer {
-			// Simulate a slow renderer.
-			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
-		}
-		img := track.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
-		switch img := img.(type) {
-		case *image.Uniform:
-			return textureCompressed{
-				uniform: img,
-			}
-		case *image.RGBA:
-			buf := bytes.NewBuffer(nil)
-			// We benchmarked planar RLE vs packed DEFLATE. Compression, RLE was slightly faster at worse compression.
-			// Decompression, DEFLATE was 3x faster.
-			w, _ := flate.NewWriter(buf, flate.BestSpeed)
-			w.Write(img.Pix)
-			w.Close()
-			return textureCompressed{
-				compressed: buf.Bytes(),
-			}
-
-		case nil:
-			// Cancelled
-			return textureCompressed{}
-		default:
-			panic(fmt.Sprintf("unexpected type %T", img))
-		}
-	})
 	return out
 }
 
@@ -546,34 +439,23 @@ type pixel struct {
 	sumWeight float64
 }
 
-// computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
-// appropriate fields in tex.
-func (track *Track) computeTexture(
-	start trace.Timestamp,
-	nsPerPx float64,
-	spans Items[ptrace.Span],
-	tex *texture,
-	tr *Trace,
-	spanColor func(ptrace.Span, *Trace) colorIndex,
-	cancelled <-chan struct{},
-) image.Image {
-	// r := &track.rnd
+// computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx].
+func computeTexture(tex *texture) image.Image {
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
 
-	t := time.Now()
-
-	renderTrace("Computing texture at %d ns @ %f ns/px", start, nsPerPx)
+	renderTrace("Computing texture at %d ns @ %f ns/px", tex.start, tex.nsPerPx)
 
 	// The texture covers the time range [start, end]
-	end := trace.Timestamp(math.Ceil(float64(start) + nsPerPx*texWidth))
+	end := trace.Timestamp(math.Ceil(float64(tex.start) + tex.nsPerPx*texWidth))
+	spans := tex.track.spans.MustResult()
 
-	if nsPerPx == 0 {
+	if tex.nsPerPx == 0 {
 		panic("got zero nsPerPx")
 	}
 
 	first := sort.Search(spans.Len(), func(i int) bool {
-		return spans.At(i).End >= start
+		return spans.At(i).End >= tex.start
 	})
 	last := sort.Search(spans.Len(), func(i int) bool {
 		return spans.At(i).Start >= end
@@ -618,16 +500,16 @@ func (track *Track) computeTexture(
 	for i := first; i < last; i++ {
 		if i%10000 == 0 {
 			select {
-			case <-cancelled:
-				renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-				return nil
+			// case <-cancelled:
+			// 	renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
+			// 	return nil
 			default:
 			}
 		}
 		span := spans.At(i)
 
-		firstBucket := float64(span.Start-start) / nsPerPx
-		lastBucket := float64(span.End-start) / nsPerPx
+		firstBucket := float64(span.Start-tex.start) / tex.nsPerPx
+		lastBucket := float64(span.End-tex.start) / tex.nsPerPx
 
 		if firstBucket >= texWidth {
 			break
@@ -639,12 +521,12 @@ func (track *Track) computeTexture(
 		firstBucket = max(firstBucket, 0)
 		lastBucket = min(lastBucket, texWidth)
 
-		colorIdx := spanColor(spans.At(i), tr)
+		colorIdx := tex.track.SpanColor(spans.At(i), tex.track.parent.cv.trace)
 		c := mappedColors[colorIdx]
 
 		if int(firstBucket) == int(lastBucket) {
 			// falls into a single bucket
-			w := float64(span.Duration()) / nsPerPx
+			w := float64(span.Duration()) / tex.nsPerPx
 			addSample(int(firstBucket), w, c)
 		} else {
 			// falls into at least two buckets
@@ -665,9 +547,9 @@ func (track *Track) computeTexture(
 	}
 
 	select {
-	case <-cancelled:
-		renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-		return nil
+	// case <-cancelled:
+	// 	renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
+	// 	return nil
 	default:
 	}
 
@@ -699,27 +581,21 @@ func (track *Track) computeTexture(
 		s[3] = srgb.A
 	}
 
-	// XXX remove tex.computedIn field, change allTextures to be time.Duration -> *texture
-	tex.computedIn.Store(uint64(time.Since(t)))
 	return img
 }
 
 // Render returns a series of textures that when placed next to each other will display spans for the time range [start,
 // end]. Each texture contains instructions for applying scaling and offsetting, and the series of textures may have
 // gaps, expecting the background to already look as desired.
-func (track *Track) Render(
+func (r *Renderer) Render(
 	win *theme.Window,
-	spans Items[ptrace.Span],
+	track *Track,
 	nsPerPx float64,
-	tr *Trace,
-	spanColor func(ptrace.Span, *Trace) colorIndex,
 	start trace.Timestamp,
 	end trace.Timestamp,
 	out []TextureStack,
-	allTextures *mysync.Mutex[*TrackedTextures],
 ) []TextureStack {
-	r := &track.rnd
-
+	spans := track.spans.MustResult()
 	if c, ok := spans.Container(); ok {
 		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px in a track in timeline %q", start, end, nsPerPx, c.Timeline.shortName)
 	} else {
@@ -728,9 +604,6 @@ func (track *Track) Render(
 
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
-	}
-	if spanColor == nil {
-		spanColor = defaultSpanColor
 	}
 
 	if spans.Len() == 0 {
@@ -748,17 +621,14 @@ func (track *Track) Render(
 		if newStart >= end || newEnd <= start {
 			return nil
 		}
-		tex := &texture{
-			start:   newStart,
-			nsPerPx: float64(newEnd-newStart) / texWidth,
-			// We don't add to globalStats.UniformsNum here, because this uniform is reused many times without
-			// increasing memory usage.
-			realized: theme.Immediate(textureRealized{
-				image: stackPlaceholderUniform,
-				op:    stackPlaceholderOp,
-			}),
-			level: uint8(math.Log2(nsPerPx)),
-		}
+		// OPT(dh): avoiding this allocation would be nice
+		tex := instantUniform(&texture{
+			track:     track,
+			start:     newStart,
+			nsPerPx:   float64(newEnd-newStart) / texWidth,
+			level:     uint8(math.Log2(nsPerPx)),
+			ephemeral: true,
+		}, stackPlaceholderUniform, stackPlaceholderOp)
 		out = append(out, TextureStack{
 			texs: []Texture{
 				{
@@ -809,7 +679,7 @@ func (track *Track) Render(
 	}
 	texs := r.texsOut
 	for start := start; start < end; start += step {
-		texs = track.renderTexture(win, start, nsPerPx, spans, tr, spanColor, texs[:0], allTextures)
+		texs = r.planTextures(win, track, start, nsPerPx, texs[:0])
 
 		var texs2 []Texture
 		for _, tex := range texs {
@@ -833,11 +703,172 @@ func (track *Track) Render(
 	return out
 }
 
-var addedTotal atomic.Uint64
-var removedTotal atomic.Uint64
-var totalInserted atomic.Uint64
-
 type TextureManager struct {
-	// NewTextures tracks textures
-	NewTextures Set[*texture]
+	Stats RendererStatistics
+
+	rgbas         *mysync.Mutex[*container.RBTree[comparableTimeDuration, *texture]]
+	realizedRGBAs *mysync.Mutex[Set[*texture]]
+}
+
+func (tm *TextureManager) Render(
+	win *theme.Window,
+	track *Track,
+	nsPerPx float64,
+	start trace.Timestamp,
+	end trace.Timestamp,
+	out []TextureStack,
+) []TextureStack {
+	return track.rnd.Render(win, track, nsPerPx, start, end, out)
+}
+
+func (tm *TextureManager) Image(win *theme.Window, tr *Trace, tex *texture) (image.Image, paint.ImageOp, bool) {
+	tex.lastUse = win.Frame
+	if tex.realized.done == nil {
+		tm.realize(tex, tr)
+	}
+
+	if CanRecv(tex.realized.done) {
+		return tex.realized.image, tex.realized.op, true
+	} else {
+		return nil, paint.ImageOp{}, false
+	}
+}
+
+func (tm *TextureManager) uncompute(texs []*texture) {
+	var sz int
+	for _, tex := range texs {
+		// OPT(dh): remove this safety check
+		if !CanRecv(tex.computed.done) {
+			panic("unreachable")
+		}
+		if tex.computed.compressed == nil {
+			panic("unreachable")
+		}
+
+		sz += len(tex.computed.compressed)
+		tex.computed = textureComputed{}
+	}
+
+	tm.Stats.CompressedNum.Add(uint64(-len(texs)))
+	tm.Stats.CompressedSize.Add(uint64(-sz))
+}
+
+func (tm *TextureManager) unrealize(texs []*texture) {
+	s, unlock := tm.realizedRGBAs.Lock()
+	defer unlock.Unlock()
+	for _, tex := range texs {
+		// OPT(dh): remove this safety check
+		if !CanRecv(tex.realized.done) {
+			panic("unreachable")
+		}
+		tex.realized = textureRealized{}
+		s.Delete(tex)
+	}
+	tm.Stats.RealizedRGBAs.Add(uint64(-len(texs)))
+}
+
+func (tm *TextureManager) realize(tex *texture, tr *Trace) {
+	tex.realized.done = make(chan struct{})
+	renderTrace("realizing texture at %d ns @ %f ns/px for track in %q", tex.start, tex.nsPerPx, tex.track.parent.shortName)
+
+	if CanRecv(tex.computed.done) && tex.computed.uniform != nil {
+		// Some textures are immediately turned into uniforms during the planning phase and don't need concurrent
+		// computation or realization.
+		renderTrace("  realizing uniform early")
+		tex.realized.image = tex.computed.uniform
+		tex.realized.op = paint.NewImageOp(tex.computed.uniform)
+		if !tex.ephemeral {
+			tm.Stats.RealizedUniforms.Add(1)
+		}
+		close(tex.realized.done)
+		return
+	}
+
+	if tex.computed.done == nil {
+		tm.compute(tex, tr)
+	}
+
+	go func() {
+		defer close(tex.realized.done)
+		<-tex.computed.done
+		if tex.computed.uniform != nil {
+			tex.realized.image = tex.computed.uniform
+			tex.realized.op = paint.NewImageOp(tex.computed.uniform)
+			if !tex.ephemeral {
+				tm.Stats.RealizedUniforms.Add(1)
+			}
+		} else {
+			pix := pixPool.Get().([]byte)
+			r := flate.NewReader(bytes.NewReader(tex.computed.compressed))
+			io.ReadFull(r, pix)
+			if err := r.Close(); err != nil {
+				panic(fmt.Sprintf("error decompressing texture: %s", err))
+			}
+			tex.realized.image = &image.RGBA{
+				Pix:    pix,
+				Stride: 4,
+				Rect:   image.Rect(0, 0, texWidth, 1),
+			}
+			tex.realized.op = paint.NewImageOp(tex.realized.image)
+			tm.Stats.RealizedRGBAs.Add(1)
+			s, unlock := tm.realizedRGBAs.Lock()
+			defer unlock.Unlock()
+			s.Add(tex)
+			if !tex.tracked {
+				rgbas, unlock := tm.rgbas.Lock()
+				defer unlock.Unlock()
+				rgbas.Insert(comparableTimeDuration(tex.computed.computedIn), tex)
+				tex.tracked = true
+			}
+		}
+	}()
+}
+
+func (tm *TextureManager) compute(tex *texture, tr *Trace) {
+	tex.computed.done = make(chan struct{})
+
+	go func() {
+		defer close(tex.computed.done)
+		if debugSlowRenderer {
+			// Simulate a slow renderer.
+			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
+		}
+
+		t := time.Now()
+		img := computeTexture(tex)
+		// XXX only set this once because of the bst
+		tex.computed.computedIn = time.Since(t)
+		switch img := img.(type) {
+		case *image.Uniform:
+			tex.computed.uniform = img
+		case *image.RGBA:
+			buf := bytes.NewBuffer(nil)
+			// We benchmarked planar RLE vs packed DEFLATE. Compression, RLE was slightly faster at worse compression.
+			// Decompression, DEFLATE was 3x faster.
+			w, _ := flate.NewWriter(buf, flate.BestSpeed)
+			w.Write(img.Pix)
+			w.Close()
+			tex.computed.compressed = buf.Bytes()
+			tm.Stats.CompressedNum.Add(1)
+			tm.Stats.CompressedSize.Add(uint64(len(buf.Bytes())))
+		// case nil:
+		// 	// Cancelled
+		// 	return textureCompressed{}
+		default:
+			panic(fmt.Sprintf("unexpected type %T", img))
+		}
+	}()
+}
+
+func instantUniform(tex *texture, uniform *image.Uniform, op paint.ImageOp) *texture {
+	tex.computed = textureComputed{
+		uniform: uniform,
+		done:    closedDoneChannel,
+	}
+	tex.realized = textureRealized{
+		image: uniform,
+		op:    op,
+		done:  closedDoneChannel,
+	}
+	return tex
 }

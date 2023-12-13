@@ -1,7 +1,6 @@
 package main
 
 import (
-	stdcmp "cmp"
 	"context"
 	"fmt"
 	"image"
@@ -199,17 +198,16 @@ type Canvas struct {
 	timelineWidgetsCache mem.AllocationCache[TimelineWidget]
 	trackWidgetsCache    mem.AllocationCache[TrackWidget]
 
-	allTextures  *mysync.Mutex[*TrackedTextures]
-	usedTextures map[*texture]struct{}
+	textures TextureManager
 }
 
 type costSortedTexture struct {
 	tex *texture
 }
 
-func (t1 costSortedTexture) Compare(t2 costSortedTexture) int {
-	return stdcmp.Compare(t1.tex.computedIn.Load(), t2.tex.computedIn.Load())
-}
+// func (t1 costSortedTexture) Compare(t2 costSortedTexture) int {
+// 	return stdcmp.Compare(t1.tex.computedIn.Load(), t2.tex.computedIn.Load())
+// }
 
 func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 	*cv = Canvas{
@@ -222,8 +220,10 @@ func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 		debugWindow:    dwin,
 		itemToTimeline: make(map[any]*Timeline),
 		timelines:      make([]*Timeline, 0, len(t.Goroutines)+len(t.Processors)+len(t.Machines)+2),
-		allTextures:    mysync.NewMutex(&container.RBTree[costSortedTexture, struct{}]{AllowDuplicates: true}),
-		usedTextures:   map[*texture]struct{}{},
+		textures: TextureManager{
+			rgbas:         mysync.NewMutex(&container.RBTree[comparableTimeDuration, *texture]{AllowDuplicates: true}),
+			realizedRGBAs: mysync.NewMutex(Set[*texture]{}),
+		},
 	}
 	cv.timeline.displayAllLabels = true
 	cv.timeline.hoveredSpans = NoItems[ptrace.Span]{}

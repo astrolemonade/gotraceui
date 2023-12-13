@@ -117,6 +117,14 @@ type Track struct {
 	widget *TrackWidget
 }
 
+func (track *Track) SpanColor(span ptrace.Span, tr *Trace) colorIndex {
+	if track.spanColor != nil {
+		return track.spanColor(span, tr)
+	} else {
+		return defaultSpanColor(span, tr)
+	}
+}
+
 func NewTrack(parent *Timeline, kind TrackKind) *Track {
 	return &Track{
 		parent: parent,
@@ -781,11 +789,7 @@ func (track *Track) Layout(
 
 		var cs colorIndex
 		if dspSpans.Len() == 1 {
-			if track.spanColor != nil {
-				cs = track.spanColor(dspSpans.At(0), tr)
-			} else {
-				cs = defaultSpanColor(dspSpans.At(0), tr)
-			}
+			cs = track.SpanColor(dspSpans.At(0), tr)
 		}
 
 		var minP f32.Point
@@ -995,9 +999,9 @@ func (track *Track) Layout(
 	if !debugNewTexture {
 		// OPT(dh): reuse slice between frames
 		var texs []TextureStack
-		texs = track.Render(win, spans, cv.nsPerPx, tr, track.spanColor, cv.start, cv.End(), texs, cv.allTextures)
+		texs = track.rnd.Render(win, track, cv.nsPerPx, cv.start, cv.End(), texs)
 		for _, tex := range texs {
-			if !tex.Add(win, gtx.Ops, cv.usedTextures) {
+			if !tex.Add(win, &cv.textures, tr, gtx.Ops) {
 				track.widget.lowQualityRender = true
 			}
 		}
