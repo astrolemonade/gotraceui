@@ -16,6 +16,7 @@ import (
 	"honnef.co/go/gotraceui/gesture"
 	"honnef.co/go/gotraceui/layout"
 	"honnef.co/go/gotraceui/mem"
+	"honnef.co/go/gotraceui/mysync"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace"
 	"honnef.co/go/gotraceui/trace/ptrace"
@@ -198,7 +199,7 @@ type Canvas struct {
 	timelineWidgetsCache mem.AllocationCache[TimelineWidget]
 	trackWidgetsCache    mem.AllocationCache[TrackWidget]
 
-	allTextures  *container.RBTree[costSortedTexture, struct{}]
+	allTextures  *mysync.Mutex[*TrackedTextures]
 	usedTextures map[*texture]struct{}
 }
 
@@ -221,7 +222,7 @@ func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 		debugWindow:    dwin,
 		itemToTimeline: make(map[any]*Timeline),
 		timelines:      make([]*Timeline, 0, len(t.Goroutines)+len(t.Processors)+len(t.Machines)+2),
-		allTextures:    &container.RBTree[costSortedTexture, struct{}]{AllowDuplicates: true},
+		allTextures:    mysync.NewMutex(&container.RBTree[costSortedTexture, struct{}]{AllowDuplicates: true}),
 		usedTextures:   map[*texture]struct{}{},
 	}
 	cv.timeline.displayAllLabels = true

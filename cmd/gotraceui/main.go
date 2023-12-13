@@ -464,6 +464,33 @@ type TimelinesComponent struct {
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	// XXX move all of this code into Canvas.Layout
 
+	var newTextures map[*texture]struct{}
+	for tex := range newTextures {
+		if tex.computed.Cancelled() {
+			// Try to avoid restarting cancelled textures. There's still a race between us checking Cancelled
+			// and us calling ResultNoWait, but this is better than always causing a restart.
+			delete(newTextures, tex)
+		}
+		data, ok := tex.computed.ResultNoWait()
+		if !ok {
+			continue
+		}
+		if len(data.compressed) != 0 {
+			globalStats.CompressedNum.Add(1)
+			globalStats.CompressedSize.Add(uint64(len(data.compressed)))
+			addedTotal.Add(uint64(len(data.compressed)))
+		}
+		// XXX allTextures no longer needs a lock
+		if !tex.added {
+			tex.added = true
+			a, unlock := allTextures.Lock()
+			a.Insert(costSortedTexture{tex}, struct{}{})
+			totalInserted.Add(1)
+			unlock.Unlock()
+		}
+		delete(newTextures, tex)
+	}
+
 	// Every compactInterval we check the size of all textures and compressed data. If they exceed their
 	// limits, we delete the least frequently used textures and the cheapest to recompute compressed textures
 	// until we are under 50% of the respective limits again.
@@ -487,7 +514,9 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			fmt.Println("--- Before ---")
 			fmt.Println(&globalStats)
 			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-			fmt.Println("All textures:", tlc.cv.allTextures.NumValues)
+			at, unlock := tlc.cv.allTextures.RLock()
+			fmt.Println("All textures:", at.NumValues)
+			unlock.RUnlock()
 
 			t = time.Now()
 			n = len(tlc.cv.usedTextures)
@@ -522,31 +551,37 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			deletedRGBANum = todo
 		}
 
+		unready := 0
+		wasNil := 0
+		used := 0
 		if sizeCompressed > maxCompressedMemoryUsage {
 			remaining := int(sizeCompressed - maxCompressedMemoryUsage/2)
 			if debugTextureCompaction {
 				fmt.Println("Need to collect", float64(remaining)/1024/1024, "MiB compressed data")
 			}
 
-			tlc.cv.allTextures.Inorder(func(cst costSortedTexture, s struct{}) bool {
-				if !cst.tex.stored {
-					panic("unreachable")
-				}
-
+			at, unlock := tlc.cv.allTextures.RLock()
+			lookedAt := 0
+			at.Inorder(func(cst costSortedTexture, s struct{}) bool {
 				if remaining <= 0 {
 					return false
 				}
+				lookedAt++
 				if cst.tex.computed == nil {
 					// This happens if the compressed texture has already been deleted and not yet
 					// recreated.
+					wasNil++
 					return true
 				}
 				_, ok := cst.tex.computed.ResultNoWait()
 				if !ok {
-					// This happens if the compressed texture has been deleted and is in the process of
-					// being recreated.
+					unready++
+					// This happens if the compressed texture has been deleted and is in the process of being
+					// recreated, or due to the race between the tex.computed future updating allTextures and
+					// the future returning and being marked as ready.
 					return true
 				}
+				used++
 				sz := len(cst.tex.computed.MustResult().compressed)
 				remaining -= sz
 				cst.tex.computed = nil
@@ -554,11 +589,20 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 				deletedCompressedSize += sz
 				globalStats.CompressedNum.Add(^uint64(0))
 				globalStats.CompressedSize.Add(uint64(-sz))
+				removedTotal.Add(uint64(sz))
 				return true
 			})
+			unlock.RUnlock()
+		}
 
-			if deletedCompressedSize < int(sizeCompressed-maxCompressedMemoryUsage/2) {
-				panic(fmt.Sprintf("had to delete %d of compressed data but only deleted %d", int(sizeCompressed-maxCompressedMemoryUsage/2), deletedCompressedSize))
+		fullPassNonNil := 0
+		for _, tl := range tlc.cv.timelines {
+			for _, track := range tl.tracks {
+				for _, tex := range track.rnd.textures {
+					if tex.computed != nil {
+						fullPassNonNil++
+					}
+				}
 			}
 		}
 
@@ -567,9 +611,16 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			fmt.Println("--- After ---")
 			fmt.Println(&globalStats)
 			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-			fmt.Println("All textures:", tlc.cv.allTextures.NumValues)
+			at, unlock := tlc.cv.allTextures.RLock()
+			fmt.Println("All textures:", at.NumValues)
+			unlock.RUnlock()
 			fmt.Printf("Inspected %d textures, compacted %d, in %s\n", n, deletedRGBANum, d)
-			fmt.Printf("Deleted %f MiB compressed\n", float64(deletedCompressedSize)/1024/1024)
+			fmt.Printf("Deleted %d (%f MiB) compressed\n", used, float64(deletedCompressedSize)/1024/1024)
+			fmt.Printf("%d compressed weren't ready\n", unready)
+			fmt.Printf("%d compressed were nil\n", wasNil)
+			fmt.Printf("%d added, %d removed\n", addedTotal.Load(), removedTotal.Load())
+			fmt.Printf("%d full pass non-nil\n", fullPassNonNil)
+			fmt.Printf("We think we inserted %d textures\n", totalInserted.Load())
 		}
 	}
 
@@ -579,7 +630,9 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		fmt.Println("--- Stats ---")
 		fmt.Println(&globalStats)
 		fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-		fmt.Println("All textures:", tlc.cv.allTextures.NumValues)
+		at, unlock := tlc.cv.allTextures.RLock()
+		fmt.Println("All textures:", at.NumValues)
+		unlock.RUnlock()
 	}
 
 	if true {
@@ -2066,32 +2119,6 @@ func cmp[T constraints.Ordered](a, b T, negate bool) int {
 	return ret
 }
 
-type Mutex[T any] struct {
-	mu sync.RWMutex
-	v  T
-}
+type TrackedTextures = container.RBTree[costSortedTexture, struct{}]
 
-type MutexUnlock struct {
-	mu *sync.RWMutex
-}
-
-type MutexRUnlock struct {
-	mu *sync.RWMutex
-}
-
-func NewMutex[T any](v T) *Mutex[T] {
-	return &Mutex[T]{v: v}
-}
-
-func (mu *Mutex[T]) Lock() (T, MutexUnlock) {
-	mu.mu.Lock()
-	return mu.v, MutexUnlock{&mu.mu}
-}
-
-func (mu *Mutex[T]) RLock() (T, MutexRUnlock) {
-	mu.mu.RLock()
-	return mu.v, MutexRUnlock{&mu.mu}
-}
-
-func (u MutexUnlock) Unlock()   { u.mu.Unlock() }
-func (u MutexRUnlock) RUnlock() { u.mu.RUnlock() }
+type Set[T any] map[T]struct{}

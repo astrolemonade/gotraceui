@@ -31,7 +31,7 @@ import (
 
 	"honnef.co/go/gotraceui/clip"
 	"honnef.co/go/gotraceui/color"
-	"honnef.co/go/gotraceui/container"
+	"honnef.co/go/gotraceui/mysync"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace"
 	"honnef.co/go/gotraceui/trace/ptrace"
@@ -60,11 +60,12 @@ const (
 	logOffset = 16
 
 	// How many frames to wait between compaction attempts
-	compactInterval = 100
+	compactInterval = 10
 	// Maximum memory to spend on storing textures
 	maxTextureMemoryUsage = 1 * 1024 * 1024
 	// 10% for compressed textures
-	maxCompressedMemoryUsage = maxTextureMemoryUsage / 10
+	// maxCompressedMemoryUsage = maxTextureMemoryUsage / 10
+	maxCompressedMemoryUsage = 0
 	// the remainder for decompressed textures
 	maxRGBAMemoryUsage = maxTextureMemoryUsage - maxCompressedMemoryUsage
 )
@@ -108,9 +109,9 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (best bool) {
+func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]struct{}) (best bool) {
 	for i, t := range tex.texs {
-		_, imgOp, ok := t.tex.get(win, used, allTextures)
+		_, imgOp, ok := t.tex.get(win, used)
 		if !ok {
 			continue
 		}
@@ -170,7 +171,7 @@ type texture struct {
 	computed *theme.Future[textureCompressed]
 	realized *theme.Future[textureRealized]
 
-	stored bool
+	added bool
 }
 
 type textureCompressed struct {
@@ -183,12 +184,12 @@ type textureRealized struct {
 	op    paint.ImageOp
 }
 
-func (tex *texture) get(win *theme.Window, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (image.Image, paint.ImageOp, bool) {
+func (tex *texture) get(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
 	tex.lastUse = win.Frame
-	return tex.getNoUse(win, used, allTextures)
+	return tex.getNoUse(win, used)
 }
 
-func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (image.Image, paint.ImageOp, bool) {
+func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
 	if tex.realized != nil {
 		if data, ok := tex.realized.ResultNoWait(); ok {
 			if _, ok := data.image.(*image.RGBA); ok {
@@ -218,13 +219,6 @@ func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allT
 			op:    op,
 		})
 		return data.uniform, op, true
-	}
-
-	// XXX do we always get here for a new texture? what if multiple textures in a texture stack are racing to finish
-	// computing and we render one of them but not the others?
-	if !tex.stored {
-		tex.stored = true
-		allTextures.Insert(costSortedTexture{tex}, struct{}{})
 	}
 
 	used[tex] = struct{}{}
@@ -323,11 +317,11 @@ var globalUsedBitmap struct {
 	bits big.Int
 }
 
-func (stats *RendererStatistics) Add(other *RendererStatistics) {
-	stats.UniformsNum.Add(other.UniformsNum.Load())
-	stats.RGBANum.Add(other.RGBANum.Load())
-	stats.CompressedSize.Add(other.CompressedSize.Load())
-}
+// func (stats *RendererStatistics) Add(other *RendererStatistics) {
+// 	stats.UniformsNum.Add(other.UniformsNum.Load())
+// 	stats.RGBANum.Add(other.RGBANum.Load())
+// 	stats.CompressedSize.Add(other.CompressedSize.Load())
+// }
 
 func (stats *RendererStatistics) String() string {
 	f := `Uniforms: %d (%f MiB)
@@ -352,6 +346,8 @@ func (track *Track) renderTexture(
 	tr *Trace,
 	spanColor func(ptrace.Span, *Trace) colorIndex,
 	out []*texture,
+	newTextures map[*texture]struct{},
+	allTextures *mysync.Mutex[*TrackedTextures],
 ) []*texture {
 	r := &track.rnd
 	renderTrace("  rendering texture at %d ns @ %f ns/px", start, nsPerPx)
@@ -512,6 +508,7 @@ func (track *Track) renderTexture(
 	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
+	newTextures[tex] = struct{}{}
 	tex.computed = theme.NewFuture(win, func(cancelled <-chan struct{}) textureCompressed {
 		if debugSlowRenderer {
 			// Simulate a slow renderer.
@@ -530,8 +527,6 @@ func (track *Track) renderTexture(
 			w, _ := flate.NewWriter(buf, flate.BestSpeed)
 			w.Write(img.Pix)
 			w.Close()
-			globalStats.CompressedNum.Add(1)
-			globalStats.CompressedSize.Add(uint64(len(buf.Bytes())))
 			return textureCompressed{
 				compressed: buf.Bytes(),
 			}
@@ -553,7 +548,15 @@ type pixel struct {
 
 // computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx]. It will populate the
 // appropriate fields in tex.
-func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tex *texture, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, cancelled <-chan struct{}) image.Image {
+func (track *Track) computeTexture(
+	start trace.Timestamp,
+	nsPerPx float64,
+	spans Items[ptrace.Span],
+	tex *texture,
+	tr *Trace,
+	spanColor func(ptrace.Span, *Trace) colorIndex,
+	cancelled <-chan struct{},
+) image.Image {
 	// r := &track.rnd
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
@@ -696,6 +699,7 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 		s[3] = srgb.A
 	}
 
+	// XXX remove tex.computedIn field, change allTextures to be time.Duration -> *texture
 	tex.computedIn.Store(uint64(time.Since(t)))
 	return img
 }
@@ -712,6 +716,7 @@ func (track *Track) Render(
 	start trace.Timestamp,
 	end trace.Timestamp,
 	out []TextureStack,
+	allTextures *mysync.Mutex[*TrackedTextures],
 ) []TextureStack {
 	r := &track.rnd
 
@@ -804,7 +809,7 @@ func (track *Track) Render(
 	}
 	texs := r.texsOut
 	for start := start; start < end; start += step {
-		texs = track.renderTexture(win, start, nsPerPx, spans, tr, spanColor, texs[:0])
+		texs = track.renderTexture(win, start, nsPerPx, spans, tr, spanColor, texs[:0], allTextures)
 
 		var texs2 []Texture
 		for _, tex := range texs {
@@ -826,4 +831,13 @@ func (track *Track) Render(
 	r.texsOut = texs[:0]
 
 	return out
+}
+
+var addedTotal atomic.Uint64
+var removedTotal atomic.Uint64
+var totalInserted atomic.Uint64
+
+type TextureManager struct {
+	// NewTextures tracks textures
+	NewTextures Set[*texture]
 }

@@ -89,6 +89,15 @@ func (ft *Future[T]) MustResult() T {
 	return v
 }
 
+func (ft *Future[T]) Cancelled() bool {
+	select {
+	case <-ft.cancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 func (ft *Future[T]) Wait() T {
 	if ft.resSet {
 		return ft.res
