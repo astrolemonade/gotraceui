@@ -487,7 +487,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			fmt.Println("--- Before ---")
 			fmt.Println(&globalStats)
 			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-			fmt.Println("All textures:", tlc.cv.allTextures.NumNodes)
+			fmt.Println("All textures:", tlc.cv.allTextures.NumValues)
 
 			t = time.Now()
 			n = len(tlc.cv.usedTextures)
@@ -515,7 +515,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			})
 			todo = min(todo, len(texs))
 			for _, tex := range texs[:todo] {
-				tex.data2 = nil
+				tex.realized = nil
 				delete(tlc.cv.usedTextures, tex)
 			}
 			globalStats.RGBANum.Add(uint64(-todo))
@@ -523,35 +523,43 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		}
 
 		if sizeCompressed > maxCompressedMemoryUsage {
-			remaining := int64(sizeCompressed - maxCompressedMemoryUsage/2)
+			remaining := int(sizeCompressed - maxCompressedMemoryUsage/2)
 			if debugTextureCompaction {
 				fmt.Println("Need to collect", float64(remaining)/1024/1024, "MiB compressed data")
 			}
 
 			tlc.cv.allTextures.Inorder(func(cst costSortedTexture, s struct{}) bool {
+				if !cst.tex.stored {
+					panic("unreachable")
+				}
+
 				if remaining <= 0 {
 					return false
 				}
-				if cst.tex.data1 == nil {
+				if cst.tex.computed == nil {
 					// This happens if the compressed texture has already been deleted and not yet
 					// recreated.
 					return true
 				}
-				_, ok := cst.tex.data1.ResultNoWait()
+				_, ok := cst.tex.computed.ResultNoWait()
 				if !ok {
 					// This happens if the compressed texture has been deleted and is in the process of
 					// being recreated.
 					return true
 				}
-				sz := len(cst.tex.data1.MustResult().compressed)
-				remaining -= int64(sz)
-				cst.tex.data1 = nil
+				sz := len(cst.tex.computed.MustResult().compressed)
+				remaining -= sz
+				cst.tex.computed = nil
 				// OPT(dh): batch stats updates
 				deletedCompressedSize += sz
 				globalStats.CompressedNum.Add(^uint64(0))
 				globalStats.CompressedSize.Add(uint64(-sz))
 				return true
 			})
+
+			if deletedCompressedSize < int(sizeCompressed-maxCompressedMemoryUsage/2) {
+				panic(fmt.Sprintf("had to delete %d of compressed data but only deleted %d", int(sizeCompressed-maxCompressedMemoryUsage/2), deletedCompressedSize))
+			}
 		}
 
 		if active && debugTextureCompaction {
@@ -559,7 +567,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 			fmt.Println("--- After ---")
 			fmt.Println(&globalStats)
 			fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-			fmt.Println("All textures:", tlc.cv.allTextures.NumNodes)
+			fmt.Println("All textures:", tlc.cv.allTextures.NumValues)
 			fmt.Printf("Inspected %d textures, compacted %d, in %s\n", n, deletedRGBANum, d)
 			fmt.Printf("Deleted %f MiB compressed\n", float64(deletedCompressedSize)/1024/1024)
 		}
@@ -571,7 +579,7 @@ func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) lay
 		fmt.Println("--- Stats ---")
 		fmt.Println(&globalStats)
 		fmt.Println("Used textures:", len(tlc.cv.usedTextures))
-		fmt.Println("All textures:", tlc.cv.allTextures.NumNodes)
+		fmt.Println("All textures:", tlc.cv.allTextures.NumValues)
 	}
 
 	if true {

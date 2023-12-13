@@ -62,7 +62,7 @@ const (
 	// How many frames to wait between compaction attempts
 	compactInterval = 100
 	// Maximum memory to spend on storing textures
-	maxTextureMemoryUsage = 100 * 1024 * 1024
+	maxTextureMemoryUsage = 1 * 1024 * 1024
 	// 10% for compressed textures
 	maxCompressedMemoryUsage = maxTextureMemoryUsage / 10
 	// the remainder for decompressed textures
@@ -167,18 +167,18 @@ type texture struct {
 	// 15x to 150x. For 8192-wide textures, the increase from 32 KiB to 34 KiB (at a 15x ratio) is only a
 	// 6.25% increase in size. In return for that increase we don't have to spend 500 µs per texture we want
 	// to compress, and we only have to compress a given texture once.
-	data1 *theme.Future[textureData1]
-	data2 *theme.Future[textureData2]
+	computed *theme.Future[textureCompressed]
+	realized *theme.Future[textureRealized]
 
 	stored bool
 }
 
-type textureData1 struct {
+type textureCompressed struct {
 	compressed []byte
 	uniform    *image.Uniform
 }
 
-type textureData2 struct {
+type textureRealized struct {
 	image image.Image
 	op    paint.ImageOp
 }
@@ -189,8 +189,8 @@ func (tex *texture) get(win *theme.Window, used map[*texture]struct{}, allTextur
 }
 
 func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (image.Image, paint.ImageOp, bool) {
-	if tex.data2 != nil {
-		if data, ok := tex.data2.ResultNoWait(); ok {
+	if tex.realized != nil {
+		if data, ok := tex.realized.ResultNoWait(); ok {
 			if _, ok := data.image.(*image.RGBA); ok {
 				used[tex] = struct{}{}
 			}
@@ -201,32 +201,34 @@ func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allT
 		}
 	}
 
-	if tex.data1 == nil {
+	if tex.computed == nil {
 		panic("unreachable")
 	}
 
-	data, ok := tex.data1.ResultNoWait()
+	data, ok := tex.computed.ResultNoWait()
 	if !ok {
 		return nil, paint.ImageOp{}, false
-	}
-
-	if !tex.stored {
-		tex.stored = true
-		allTextures.Insert(costSortedTexture{tex}, struct{}{})
 	}
 
 	if data.uniform != nil {
 		op := paint.NewImageOp(data.uniform)
 		globalStats.UniformsNum.Add(1)
-		tex.data2 = theme.Immediate(textureData2{
+		tex.realized = theme.Immediate(textureRealized{
 			image: data.uniform,
 			op:    op,
 		})
 		return data.uniform, op, true
 	}
 
+	// XXX do we always get here for a new texture? what if multiple textures in a texture stack are racing to finish
+	// computing and we render one of them but not the others?
+	if !tex.stored {
+		tex.stored = true
+		allTextures.Insert(costSortedTexture{tex}, struct{}{})
+	}
+
 	used[tex] = struct{}{}
-	tex.data2 = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData2 {
+	tex.realized = theme.NewFuture(win, func(cancelled <-chan struct{}) textureRealized {
 		if data.compressed == nil {
 			panic("unreachable")
 		}
@@ -243,7 +245,7 @@ func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allT
 			Rect:   image.Rect(0, 0, texWidth, 1),
 		}
 		globalStats.RGBANum.Add(1)
-		return textureData2{
+		return textureRealized{
 			image: img,
 			op:    paint.NewImageOp(img),
 		}
@@ -253,16 +255,16 @@ func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allT
 }
 
 func (tex *texture) ready() bool {
-	if tex.data2 != nil {
-		_, ok := tex.data2.ResultNoWait()
+	if tex.realized != nil {
+		_, ok := tex.realized.ResultNoWait()
 		return ok
 	}
 
-	if tex.data1 == nil {
+	if tex.computed == nil {
 		panic("unreachable")
 	}
 
-	data, ok := tex.data1.ResultNoWait()
+	data, ok := tex.computed.ResultNoWait()
 	return ok && data.uniform != nil
 }
 
@@ -388,9 +390,9 @@ func (track *Track) renderTexture(
 			}
 		}
 	}
-	foundExact := tex != nil && (tex.data1 != nil || tex.data2 != nil)
+	foundExact := tex != nil && (tex.computed != nil || tex.realized != nil)
 
-	if tex != nil && (tex.data1 != nil || tex.data2 != nil) {
+	if tex != nil && (tex.computed != nil || tex.realized != nil) {
 		out = append(out, tex)
 
 		if tex.ready() {
@@ -417,7 +419,7 @@ func (track *Track) renderTexture(
 			continue
 		}
 		f := textures[n]
-		if f.data1 == nil && f.data2 == nil {
+		if f.computed == nil && f.realized == nil {
 			continue
 		}
 		if f.start <= start {
@@ -453,7 +455,7 @@ func (track *Track) renderTexture(
 			continue
 		}
 		f := textures[n]
-		if f.data1 == nil && f.data2 == nil {
+		if f.computed == nil && f.realized == nil {
 			continue
 		}
 		if f.start <= start {
@@ -476,7 +478,7 @@ func (track *Track) renderTexture(
 			level:   uint8(logNsPerPx),
 			// We don't add to globalStats.UniformsNum here, because this uniform is reused many times without
 			// increasing memory usage.
-			data2: theme.Immediate(textureData2{
+			realized: theme.Immediate(textureRealized{
 				image: placeholderUniform,
 				op:    placeholderOp,
 			}),
@@ -492,7 +494,7 @@ func (track *Track) renderTexture(
 	}
 
 	if tex != nil {
-		if tex.data1 != nil {
+		if tex.computed != nil {
 			panic("unreachable")
 		}
 		renderTrace("    exact match had its compressed data deleted, recomputing")
@@ -510,7 +512,7 @@ func (track *Track) renderTexture(
 	r.textures = slices.Insert(r.textures, texsStart+n, tex)
 	out = slices.Insert(out, 0, tex)
 
-	tex.data1 = theme.NewFuture(win, func(cancelled <-chan struct{}) textureData1 {
+	tex.computed = theme.NewFuture(win, func(cancelled <-chan struct{}) textureCompressed {
 		if debugSlowRenderer {
 			// Simulate a slow renderer.
 			time.Sleep(time.Duration(rand.Intn(1000)+3000) * time.Millisecond)
@@ -518,7 +520,7 @@ func (track *Track) renderTexture(
 		img := track.computeTexture(start, nsPerPx, spans, tex, tr, spanColor, cancelled)
 		switch img := img.(type) {
 		case *image.Uniform:
-			return textureData1{
+			return textureCompressed{
 				uniform: img,
 			}
 		case *image.RGBA:
@@ -530,13 +532,13 @@ func (track *Track) renderTexture(
 			w.Close()
 			globalStats.CompressedNum.Add(1)
 			globalStats.CompressedSize.Add(uint64(len(buf.Bytes())))
-			return textureData1{
+			return textureCompressed{
 				compressed: buf.Bytes(),
 			}
 
 		case nil:
 			// Cancelled
-			return textureData1{}
+			return textureCompressed{}
 		default:
 			panic(fmt.Sprintf("unexpected type %T", img))
 		}
@@ -746,7 +748,7 @@ func (track *Track) Render(
 			nsPerPx: float64(newEnd-newStart) / texWidth,
 			// We don't add to globalStats.UniformsNum here, because this uniform is reused many times without
 			// increasing memory usage.
-			data2: theme.Immediate(textureData2{
+			realized: theme.Immediate(textureRealized{
 				image: stackPlaceholderUniform,
 				op:    stackPlaceholderOp,
 			}),

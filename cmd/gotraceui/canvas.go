@@ -221,7 +221,7 @@ func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 		debugWindow:    dwin,
 		itemToTimeline: make(map[any]*Timeline),
 		timelines:      make([]*Timeline, 0, len(t.Goroutines)+len(t.Processors)+len(t.Machines)+2),
-		allTextures:    &container.RBTree[costSortedTexture, struct{}]{},
+		allTextures:    &container.RBTree[costSortedTexture, struct{}]{AllowDuplicates: true},
 		usedTextures:   map[*texture]struct{}{},
 	}
 	cv.timeline.displayAllLabels = true
