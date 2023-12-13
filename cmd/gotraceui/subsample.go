@@ -1,13 +1,8 @@
 package main
 
-// TODO notes: we benchmarked planar RLE vs packed DEFLATE. compression, RLE was slightly faster at worse compression.
-// decompression, DEFLATE was 3x faster.
-
 // TODO ahead of time generation of textures. when we request the texture for a zoom level, also generate the next zoom
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
 // and right.
-
-// TODO compress/delete unused textures
 
 // TODO fix borders for hovered merged spans
 
@@ -36,6 +31,7 @@ import (
 
 	"honnef.co/go/gotraceui/clip"
 	"honnef.co/go/gotraceui/color"
+	"honnef.co/go/gotraceui/container"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace"
 	"honnef.co/go/gotraceui/trace/ptrace"
@@ -47,11 +43,11 @@ import (
 
 const (
 	// Simulate a slow system by delaying texture computation by a random amount of time.
-	debugSlowRenderer     = false
-	debugDisplayGradients = false
-	debugDisplayZoom      = false
-	debugTraceRenderer    = false
-	debugTraceCompaction  = true
+	debugSlowRenderer      = false
+	debugDisplayGradients  = false
+	debugDisplayZoom       = false
+	debugTraceRenderer     = false
+	debugTextureCompaction = true
 
 	texWidth = 8192
 	// Offset log2(nsPerPx) by this much to ensure it is positive. 16 allows for 1 ns / 64k pixels, which realistically
@@ -65,8 +61,12 @@ const (
 
 	// How many frames to wait between compaction attempts
 	compactInterval = 100
-	// Maximum memory to spend on storing decompressed textures
+	// Maximum memory to spend on storing textures
 	maxTextureMemoryUsage = 100 * 1024 * 1024
+	// 10% for compressed textures
+	maxCompressedMemoryUsage = maxTextureMemoryUsage / 10
+	// the remainder for decompressed textures
+	maxRGBAMemoryUsage = maxTextureMemoryUsage - maxCompressedMemoryUsage
 )
 
 // Counter of currently computing textures.
@@ -108,9 +108,9 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]struct{}) (best bool) {
+func (tex TextureStack) Add(win *theme.Window, ops *op.Ops, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (best bool) {
 	for i, t := range tex.texs {
-		_, imgOp, ok := t.tex.get(win, used)
+		_, imgOp, ok := t.tex.get(win, used, allTextures)
 		if !ok {
 			continue
 		}
@@ -159,6 +159,8 @@ type texture struct {
 	// effective nsPerPx.
 	level uint8
 
+	computedIn atomic.Uint64
+
 	// Compressed stores the compressed version of the texture. This is always populated for image.RGBA-backed
 	// textures once computing it has finished. That is, we don't compress textures on demand. The average
 	// compression ratio depends on the shape of the trace and the zoom level, but seems to be anywhere around
@@ -167,6 +169,8 @@ type texture struct {
 	// to compress, and we only have to compress a given texture once.
 	data1 *theme.Future[textureData1]
 	data2 *theme.Future[textureData2]
+
+	stored bool
 }
 
 type textureData1 struct {
@@ -179,12 +183,12 @@ type textureData2 struct {
 	op    paint.ImageOp
 }
 
-func (tex *texture) get(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
+func (tex *texture) get(win *theme.Window, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (image.Image, paint.ImageOp, bool) {
 	tex.lastUse = win.Frame
-	return tex.getNoUse(win, used)
+	return tex.getNoUse(win, used, allTextures)
 }
 
-func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}) (image.Image, paint.ImageOp, bool) {
+func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}, allTextures *container.RBTree[costSortedTexture, struct{}]) (image.Image, paint.ImageOp, bool) {
 	if tex.data2 != nil {
 		if data, ok := tex.data2.ResultNoWait(); ok {
 			if _, ok := data.image.(*image.RGBA); ok {
@@ -204,6 +208,11 @@ func (tex *texture) getNoUse(win *theme.Window, used map[*texture]struct{}) (ima
 	data, ok := tex.data1.ResultNoWait()
 	if !ok {
 		return nil, paint.ImageOp{}, false
+	}
+
+	if !tex.stored {
+		tex.stored = true
+		allTextures.Insert(costSortedTexture{tex}, struct{}{})
 	}
 
 	if data.uniform != nil {
@@ -303,7 +312,6 @@ type RendererStatistics struct {
 	RGBANum        atomic.Uint64
 	CompressedNum  atomic.Uint64
 	CompressedSize atomic.Uint64
-	UnreadyNum     atomic.Uint64
 }
 
 var globalStats RendererStatistics
@@ -317,33 +325,32 @@ func (stats *RendererStatistics) Add(other *RendererStatistics) {
 	stats.UniformsNum.Add(other.UniformsNum.Load())
 	stats.RGBANum.Add(other.RGBANum.Load())
 	stats.CompressedSize.Add(other.CompressedSize.Load())
-	stats.UnreadyNum.Add(other.UnreadyNum.Load())
 }
 
 func (stats *RendererStatistics) String() string {
 	f := `Uniforms: %d (%f MiB)
 RGBAs: %d (%f MiB)
-Compressed: %d (%f MiB, %f MiB uncompressed)
-Not ready/cancelled: %d`
+Compressed: %d (%f MiB, %f MiB uncompressed)`
 	return fmt.Sprintf(
 		f,
 		stats.UniformsNum.Load(), float64(stats.UniformsNum.Load()*4)/1024/1024,
 		stats.RGBANum.Load(), float64(stats.RGBANum.Load()*texWidth*4)/1024/1024,
 		stats.CompressedNum.Load(), float64(stats.CompressedSize.Load())/1024/1024, float64(stats.CompressedNum.Load()*texWidth*4)/1024/1024,
-		stats.UnreadyNum.Load(),
 	)
-}
-
-func (stats *RendererStatistics) Memory() uint64 {
-	return stats.RGBANum.Load()*texWidth*4 +
-		stats.UniformsNum.Load()*4 +
-		stats.CompressedSize.Load()
 }
 
 // renderTexture returns textures for the time range [start, start + texWidth * nsPerPx]. It may return multiple
 // textures at different zoom levels, sorted by zoom level in descending order. That is, the first texture has the
 // highest resolution.
-func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPerPx float64, spans Items[ptrace.Span], tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, out []*texture) []*texture {
+func (track *Track) renderTexture(
+	win *theme.Window,
+	start trace.Timestamp,
+	nsPerPx float64,
+	spans Items[ptrace.Span],
+	tr *Trace,
+	spanColor func(ptrace.Span, *Trace) colorIndex,
+	out []*texture,
+) []*texture {
 	r := &track.rnd
 	renderTrace("  rendering texture at %d ns @ %f ns/px", start, nsPerPx)
 
@@ -381,9 +388,9 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 			}
 		}
 	}
-	foundExact := tex != nil
+	foundExact := tex != nil && (tex.data1 != nil || tex.data2 != nil)
 
-	if tex != nil {
+	if tex != nil && (tex.data1 != nil || tex.data2 != nil) {
 		out = append(out, tex)
 
 		if tex.ready() {
@@ -410,6 +417,9 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 			continue
 		}
 		f := textures[n]
+		if f.data1 == nil && f.data2 == nil {
+			continue
+		}
 		if f.start <= start {
 			out = append(out, f)
 			foundHigher++
@@ -443,6 +453,9 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 			continue
 		}
 		f := textures[n]
+		if f.data1 == nil && f.data2 == nil {
+			continue
+		}
 		if f.start <= start {
 			out = append(out, f)
 			foundLower++
@@ -479,13 +492,16 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 	}
 
 	if tex != nil {
-		panic("unreachable")
-	}
-
-	tex = &texture{
-		start:   start,
-		nsPerPx: nsPerPx,
-		level:   uint8(logNsPerPx),
+		if tex.data1 != nil {
+			panic("unreachable")
+		}
+		renderTrace("    exact match had its compressed data deleted, recomputing")
+	} else {
+		tex = &texture{
+			start:   start,
+			nsPerPx: nsPerPx,
+			level:   uint8(logNsPerPx),
+		}
 	}
 	texsStart, texsEnd := texturesForLevelIndices(r.textures, logNsPerPx)
 	n := sort.Search(len(r.textures[texsStart:texsEnd]), func(i int) bool {
@@ -507,6 +523,8 @@ func (track *Track) renderTexture(win *theme.Window, start trace.Timestamp, nsPe
 			}
 		case *image.RGBA:
 			buf := bytes.NewBuffer(nil)
+			// We benchmarked planar RLE vs packed DEFLATE. Compression, RLE was slightly faster at worse compression.
+			// Decompression, DEFLATE was 3x faster.
 			w, _ := flate.NewWriter(buf, flate.BestSpeed)
 			w.Write(img.Pix)
 			w.Close()
@@ -537,6 +555,8 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 	// r := &track.rnd
 	debugTexturesComputing.Add(1)
 	defer debugTexturesComputing.Add(-1)
+
+	t := time.Now()
 
 	renderTrace("Computing texture at %d ns @ %f ns/px", start, nsPerPx)
 
@@ -674,13 +694,23 @@ func (track *Track) computeTexture(start trace.Timestamp, nsPerPx float64, spans
 		s[3] = srgb.A
 	}
 
+	tex.computedIn.Store(uint64(time.Since(t)))
 	return img
 }
 
 // Render returns a series of textures that when placed next to each other will display spans for the time range [start,
 // end]. Each texture contains instructions for applying scaling and offsetting, and the series of textures may have
 // gaps, expecting the background to already look as desired.
-func (track *Track) Render(win *theme.Window, spans Items[ptrace.Span], nsPerPx float64, tr *Trace, spanColor func(ptrace.Span, *Trace) colorIndex, start trace.Timestamp, end trace.Timestamp, out []TextureStack) []TextureStack {
+func (track *Track) Render(
+	win *theme.Window,
+	spans Items[ptrace.Span],
+	nsPerPx float64,
+	tr *Trace,
+	spanColor func(ptrace.Span, *Trace) colorIndex,
+	start trace.Timestamp,
+	end trace.Timestamp,
+	out []TextureStack,
+) []TextureStack {
 	r := &track.rnd
 
 	if c, ok := spans.Container(); ok {

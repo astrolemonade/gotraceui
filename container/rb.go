@@ -46,6 +46,23 @@ func NewRBNode[K Comparable[K], V any](k K, v V) *RBNode[K, V] {
 	}
 }
 
+func (t *RBTree[K, V]) Inorder(yield func(K, V) bool) {
+	t.Root.Inorder(yield)
+}
+
+func (t *RBNode[K, V]) Inorder(yield func(K, V) bool) bool {
+	if t == nil {
+		return true
+	}
+	if !t.Children[0].Inorder(yield) {
+		return false
+	}
+	if !yield(t.Key, t.Value) {
+		return false
+	}
+	return t.Children[1].Inorder(yield)
+}
+
 func (t *RBTree[K, V]) Search(k K) (node *RBNode[K, V], found bool, dir Direction) {
 	if t.Root == nil {
 		return nil, false, 0

@@ -1,6 +1,7 @@
 package main
 
 import (
+	stdcmp "cmp"
 	"context"
 	"fmt"
 	"image"
@@ -197,7 +198,16 @@ type Canvas struct {
 	timelineWidgetsCache mem.AllocationCache[TimelineWidget]
 	trackWidgetsCache    mem.AllocationCache[TrackWidget]
 
+	allTextures  *container.RBTree[costSortedTexture, struct{}]
 	usedTextures map[*texture]struct{}
+}
+
+type costSortedTexture struct {
+	tex *texture
+}
+
+func (t1 costSortedTexture) Compare(t2 costSortedTexture) int {
+	return stdcmp.Compare(t1.tex.computedIn.Load(), t2.tex.computedIn.Load())
 }
 
 func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
@@ -211,6 +221,7 @@ func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 		debugWindow:    dwin,
 		itemToTimeline: make(map[any]*Timeline),
 		timelines:      make([]*Timeline, 0, len(t.Goroutines)+len(t.Processors)+len(t.Machines)+2),
+		allTextures:    &container.RBTree[costSortedTexture, struct{}]{},
 		usedTextures:   map[*texture]struct{}{},
 	}
 	cv.timeline.displayAllLabels = true
