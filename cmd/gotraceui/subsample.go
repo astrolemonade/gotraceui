@@ -1,6 +1,14 @@
 package main
 
-// OPT cancel textures
+// On cancelling textures
+//
+// When the user zooms into the trace using an area selection, we will animate through many zoom levels,
+// possibly at a speed faster than texture computation. At first glance, it might seem like we should cancel
+// textures that we no longer need. However, individual texture computation takes well under one frame of
+// time, and cancelling it after one frame would more often than not wouldn't have any effect.
+//
+// We'd rather keep the textures around in case we need them in the future (for example when the user zooms
+// out again). If they're truly useless they'll eventually be deleted as part of texture compaction.
 
 // TODO ahead of time generation of textures. when we request the texture for a zoom level, also generate the next zoom
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
@@ -17,13 +25,14 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"context"
 	"fmt"
 	"image"
 	stdcolor "image/color"
 	"io"
-	"log"
 	"math"
 	"math/rand"
+	rtrace "runtime/trace"
 	"slices"
 	"sort"
 	"sync"
@@ -48,7 +57,6 @@ const (
 	debugSlowRenderer      = false
 	debugDisplayGradients  = false
 	debugDisplayZoom       = false
-	debugTraceRenderer     = false
 	debugTextureCompaction = false
 
 	texWidth = 8192
@@ -71,9 +79,6 @@ const (
 	maxRGBAMemoryUsage = maxTextureMemoryUsage - maxCompressedMemoryUsage
 )
 
-// Counter of currently computing textures.
-var debugTexturesComputing atomic.Int64
-
 var pixelsPool = &sync.Pool{
 	New: func() any {
 		s := make([]pixel, texWidth)
@@ -95,12 +100,6 @@ var (
 	placeholderUniform      = stackPlaceholderUniform
 	placeholderOp           = paint.NewImageOp(placeholderUniform)
 )
-
-func renderTrace(f string, v ...any) {
-	if debugTraceRenderer {
-		log.Printf(f, v...)
-	}
-}
 
 type Texture struct {
 	tex     *texture
@@ -279,10 +278,11 @@ func (r *Renderer) planTextures(
 	nsPerPx float64,
 	out []*texture,
 ) []*texture {
-	renderTrace("  planning texture at %d ns @ %f ns/px for track in %q", start, nsPerPx, track.parent.shortName)
+	defer rtrace.StartRegion(context.Background(), "main.Renderer.planTextures").End()
+	rtrace.Logf(context.Background(), "texture renderer", "planning texture at %d ns @ %f ns/px for track in %q", start, nsPerPx, track.parent.shortName)
 
 	if spans.Len() == 0 {
-		renderTrace("    no spans to plan")
+		rtrace.Logf(context.Background(), "texture renderer", "no spans to plan")
 		return out
 	}
 
@@ -294,7 +294,7 @@ func (r *Renderer) planTextures(
 	// produced by zooming out beyond the size of the track. It only has to cover up to the actual track end.
 	end = min(end, spans.At(spans.Len()-1).End)
 
-	renderTrace("    effective end is %d", end)
+	rtrace.Logf(context.Background(), "texture renderer", "effective end is %d", end)
 
 	if nsPerPx == 0 {
 		panic("got zero nsPerPx")
@@ -323,10 +323,10 @@ func (r *Renderer) planTextures(
 
 		if tex.ready() {
 			// The desired texture already exists and is ready, skip doing any further work.
-			renderTrace("    exact match is already ready to use, returning early")
+			rtrace.Logf(context.Background(), "texture renderer", "exact match is already ready to use, returning early")
 			return out
 		} else {
-			renderTrace("    found exact match, but it isn't ready yet")
+			rtrace.Logf(context.Background(), "texture renderer", "found exact match, but it isn't ready yet")
 		}
 	}
 
@@ -354,18 +354,18 @@ func (r *Renderer) planTextures(
 			if f.ready() {
 				// Don't collect more textures that'll never be used.
 				higherReady = true
-				renderTrace("    found ready higher resolution texture, not collecting any more")
+				rtrace.Logf(context.Background(), "texture renderer", "found ready higher resolution texture, not collecting any more")
 				break
 			}
 		}
 	}
 
-	renderTrace("    found %d higher resolution textures", foundHigher)
+	rtrace.Logf(context.Background(), "texture renderer", "found %d higher resolution textures", foundHigher)
 
 	if higherReady {
 		// A higher resolution texture is already ready. There is no point in looking for lower resolution ones, or
 		// computing an exact match.
-		renderTrace("    found higher resolution texture that is already ready to use, returning early")
+		rtrace.Logf(context.Background(), "texture renderer", "found higher resolution texture that is already ready to use, returning early")
 		return out
 	}
 
@@ -389,13 +389,13 @@ func (r *Renderer) planTextures(
 			foundLower++
 			if f.ready() {
 				// Don't collect more textures that'll never be used.
-				renderTrace("    found ready lower resolution texture, not collecting any more")
+				rtrace.Logf(context.Background(), "texture renderer", "found ready lower resolution texture, not collecting any more")
 				break
 			}
 		}
 	}
 
-	renderTrace("    found %d lower resolution textures", foundLower)
+	rtrace.Logf(context.Background(), "texture renderer", "found %d lower resolution textures", foundLower)
 
 	{
 		// OPT(dh): avoiding this allocation would be nice
@@ -413,12 +413,12 @@ func (r *Renderer) planTextures(
 	if foundHigher > 0 || foundExact {
 		// We're already waiting on either the exact match, or a higher resolution texture. In neither case do we want
 		// to start computing the exact match (again.)
-		renderTrace("    found an exact or higher resolution texture that is being computed, not starting another computation")
+		rtrace.Logf(context.Background(), "texture renderer", "found an exact or higher resolution texture that is being computed, not starting another computation")
 		return out
 	}
 
 	if tex != nil {
-		renderTrace("    exact match had its computed data deleted")
+		rtrace.Logf(context.Background(), "texture renderer", "exact match had its computed data deleted")
 	} else {
 		tex = &texture{
 			track:   track,
@@ -445,10 +445,9 @@ type pixel struct {
 
 // computeTexture computes a texture for the time range [start, start + texWidth * nsPerPx].
 func computeTexture(tex *texture) image.Image {
-	debugTexturesComputing.Add(1)
-	defer debugTexturesComputing.Add(-1)
+	defer rtrace.StartRegion(context.Background(), "main.computeTexture").End()
 
-	renderTrace("Computing texture at %d ns @ %f ns/px", tex.start, tex.nsPerPx)
+	rtrace.Logf(context.Background(), "texture renderer", "Computing texture at %d ns @ %f ns/px", tex.start, tex.nsPerPx)
 
 	// The texture covers the time range [start, end]
 	end := trace.Timestamp(math.Ceil(float64(tex.start) + tex.nsPerPx*texWidth))
@@ -501,14 +500,6 @@ func computeTexture(tex *texture) image.Image {
 	}
 
 	for i := first; i < last; i++ {
-		if i%10000 == 0 {
-			select {
-			// case <-cancelled:
-			// 	renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-			// 	return nil
-			default:
-			}
-		}
 		span := tex.spans.At(i)
 
 		firstBucket := float64(span.Start-tex.start) / tex.nsPerPx
@@ -547,13 +538,6 @@ func computeTexture(tex *texture) image.Image {
 			// All the full buckets between the first and last one
 			addSample(i, 1, c)
 		}
-	}
-
-	select {
-	// case <-cancelled:
-	// 	renderTrace("Cancelled computing texture at %d ns @ %f ns/px", start, nsPerPx)
-	// 	return nil
-	default:
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, texWidth, 1))
@@ -615,10 +599,11 @@ func (r *Renderer) Render(
 	end trace.Timestamp,
 	out []TextureStack,
 ) []TextureStack {
+	defer rtrace.StartRegion(context.Background(), "main.Renderer.Render").End()
 	if c, ok := spans.Container(); ok {
-		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px in a track in timeline %q", start, end, nsPerPx, c.Timeline.shortName)
+		rtrace.Logf(context.Background(), "texture renderer", "Requesting texture for [%d ns, %d ns] @ %f ns/px in a track in timeline %q", start, end, nsPerPx, c.Timeline.shortName)
 	} else {
-		renderTrace("Requesting texture for [%d ns, %d ns] @ %f ns/px", start, end, nsPerPx)
+		rtrace.Logf(context.Background(), "texture renderer", "Requesting texture for [%d ns, %d ns] @ %f ns/px", start, end, nsPerPx)
 	}
 
 	if nsPerPx == 0 {
@@ -633,7 +618,7 @@ func (r *Renderer) Render(
 		// Don't go through the normal pipeline for making textures if the spans are placeholders (which happens when we
 		// are dealing with compressed tracks.). Caching them would be wrong, as cached textures don't get invalidated
 		// when spans change, and computing them is trivial.
-		renderTrace("  returning uniform texture for stack placeholder")
+		rtrace.Logf(context.Background(), "texture renderer", "returning uniform texture for stack placeholder")
 
 		newStart := max(start, spans.At(0).Start)
 		newEnd := min(end, spans.At(0).End)
@@ -681,7 +666,7 @@ func (r *Renderer) Render(
 
 	if start >= end {
 		// We don't need a texture for an empty time interval
-		renderTrace("  not returning textures for empty time interval [%d, %d]", start, end)
+		rtrace.Logf(context.Background(), "texture renderer", "not returning textures for empty time interval [%d, %d]", start, end)
 		return out[:0]
 	}
 
@@ -743,6 +728,7 @@ func (tm *TextureManager) Render(
 }
 
 func (tm *TextureManager) Image(win *theme.Window, tr *Trace, tex *texture) (image.Image, paint.ImageOp, bool) {
+	defer rtrace.StartRegion(context.Background(), "main.TextureManager.Image").End()
 	tex.lastUse = win.Frame
 	if tex.realized.done == nil {
 		tm.realize(tex, tr)
@@ -777,13 +763,14 @@ func (tm *TextureManager) unrealize(texs []*texture) {
 }
 
 func (tm *TextureManager) realize(tex *texture, tr *Trace) {
+	defer rtrace.StartRegion(context.Background(), "main.TextureManager.realize").End()
 	tex.realized.done = make(chan struct{})
-	renderTrace("realizing texture at %d ns @ %f ns/px for track in %q", tex.start, tex.nsPerPx, tex.track.parent.shortName)
+	rtrace.Logf(context.Background(), "texture renderer", "realizing texture at %d ns @ %f ns/px for track in %q", tex.start, tex.nsPerPx, tex.track.parent.shortName)
 
 	if CanRecv(tex.computed.done) && tex.computed.uniform != nil {
 		// Some textures are immediately turned into uniforms during the planning phase and don't need concurrent
 		// computation or realization.
-		renderTrace("  realizing uniform early")
+		rtrace.Logf(context.Background(), "texture renderer", "realizing uniform early")
 		tex.realized.image = tex.computed.uniform
 		tex.realized.op = paint.NewImageOp(tex.computed.uniform)
 		if !tex.ephemeral {
@@ -798,6 +785,7 @@ func (tm *TextureManager) realize(tex *texture, tr *Trace) {
 	}
 
 	go func() {
+		defer rtrace.StartRegion(context.Background(), "main.TextureManager.realize.goroutine").End()
 		defer close(tex.realized.done)
 		<-tex.computed.done
 		if tex.computed.uniform != nil {
@@ -837,6 +825,7 @@ func (tm *TextureManager) compute(tex *texture, tr *Trace) {
 	tex.computed.done = make(chan struct{})
 
 	go func() {
+		defer rtrace.StartRegion(context.Background(), "main.TextureManager.compute.goroutine").End()
 		defer close(tex.computed.done)
 		if debugSlowRenderer {
 			// Simulate a slow renderer.
