@@ -14,8 +14,6 @@ package main
 // level in the background (depending on the direction in which the user is zooming.). Similar for panning to the left
 // and right.
 
-// TODO fix borders for hovered merged spans
-
 // TODO document the architecture of this
 
 // TODO update license/readme/... to attribute the dancing gopher
@@ -48,6 +46,7 @@ import (
 	"honnef.co/go/gotraceui/trace/ptrace"
 
 	"gioui.org/f32"
+	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/paint"
 )
@@ -111,7 +110,8 @@ type TextureStack struct {
 	texs []Texture
 }
 
-func (tex TextureStack) Add(win *theme.Window, tm *TextureManager, tr *Trace, ops *op.Ops) (best bool) {
+func (tex TextureStack) Add(win *theme.Window, gtx layout.Context, tm *TextureManager, tr *Trace, ops *op.Ops) (best bool) {
+	trackHeight := float32(gtx.Dp(timelineTrackHeightDp))
 	for i, t := range tex.texs {
 		_, imgOp, ok := tm.Image(win, tr, t.tex)
 		if !ok {
@@ -139,8 +139,8 @@ func (tex TextureStack) Add(win *theme.Window, tm *TextureManager, tr *Trace, op
 
 		// The offset only affects the clip, while the scale affects both the clip and the image.
 		defer op.Affine(f32.Affine2D{}.Offset(f32.Pt(t.XOffset, 0))).Push(ops).Pop()
-		// XXX is there a way we can fill the current clip, without having to specify its height?
-		defer op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(t.XScale, 40))).Push(ops).Pop()
+		// TODO(dh): is there a way we can fill the current clip, without having to specify its height?
+		defer op.Affine(f32.Affine2D{}.Scale(f32.Pt(0, 0), f32.Pt(t.XScale, trackHeight))).Push(ops).Pop()
 		defer clip.Rect(image.Rect(0, 0, texWidth, 1)).Push(ops).Pop()
 
 		paint.PaintOp{}.Add(ops)
@@ -315,10 +315,9 @@ func (r *Renderer) planTextures(
 			}
 		}
 	}
-	// XXX add method that encapsulates tex.computed.done != nil
 	foundExact := tex != nil && tex.computed.done != nil
 
-	if tex != nil && (tex.computed.done != nil) {
+	if foundExact {
 		out = append(out, tex)
 
 		if tex.ready() {
@@ -473,11 +472,9 @@ func computeTexture(tex *texture) image.Image {
 			return
 		}
 		if bin >= len(pixels) {
-			// XXX
 			return
 		}
 		if bin < 0 {
-			// XXX
 			return
 		}
 
@@ -711,8 +708,14 @@ func (r *Renderer) Render(
 type TextureManager struct {
 	Stats RendererStatistics
 
-	rgbas         *mysync.Mutex[*container.RBTree[comparableTimeDuration, *texture]]
+	// All known RGBA textures, including unrealized and uncomputed ones. The key is the time it took to
+	// compute the texture for the first time.
+	rgbas *mysync.Mutex[*container.RBTree[comparableTimeDuration, *texture]]
+	// All currently realized RGBA textures.
 	realizedRGBAs *mysync.Mutex[Set[*texture]]
+
+	// scratch space used by Compact
+	compactScratch []*texture
 }
 
 func (tm *TextureManager) Render(
@@ -834,7 +837,6 @@ func (tm *TextureManager) compute(tex *texture, tr *Trace) {
 
 		t := time.Now()
 		img := computeTexture(tex)
-		// XXX only set this once because of the bst
 		tex.computed.computedIn = time.Since(t)
 		switch img := img.(type) {
 		case *image.Uniform:
@@ -856,9 +858,6 @@ func (tm *TextureManager) compute(tex *texture, tr *Trace) {
 			tex.computed.compressed = buf.Bytes()
 			tm.Stats.CompressedNum.Add(1)
 			tm.Stats.CompressedSize.Add(uint64(len(buf.Bytes())))
-		// case nil:
-		// 	// Cancelled
-		// 	return textureCompressed{}
 		default:
 			panic(fmt.Sprintf("unexpected type %T", img))
 		}
@@ -876,4 +875,98 @@ func instantUniform(tex *texture, uniform *image.Uniform, op paint.ImageOp) *tex
 		done:  closedDoneChannel,
 	}
 	return tex
+}
+
+// Compact deletes unused textures to free memory.
+func (tm *TextureManager) Compact() {
+	// Every compactInterval we check the size of all textures and compressed data. If they exceed their
+	// limits, we delete the least frequently used textures and the cheapest to recompute compressed textures
+	// until we are under 50% of the respective limits again.
+	//
+	// Note that we don't ever collect uniforms, because it's hardly worth it. Even if we had a million
+	// uniforms, that would only account for 4 MB.
+	var (
+		numRGBAs       = tm.Stats.RealizedRGBAs.Load()
+		sizeRGBAs      = uint64(numRGBAs) * texWidth * 4
+		sizeCompressed = tm.Stats.CompressedSize.Load()
+
+		// The following variables are used for debug logging
+		t                     time.Time
+		deletedCompressedSize int
+		deletedRGBANum        int
+	)
+	active := sizeRGBAs > maxRGBAMemoryUsage || sizeCompressed > maxCompressedMemoryUsage
+	if active && debugTextureCompaction {
+		fmt.Println("--- Before ---")
+		fmt.Println(&tm.Stats)
+		t = time.Now()
+	}
+
+	if sizeRGBAs > maxRGBAMemoryUsage {
+		todo := int((sizeRGBAs - (maxRGBAMemoryUsage / 2)) / (texWidth * 4))
+		if debugTextureCompaction {
+			fmt.Println("Need to collect", todo, "textures")
+		}
+
+		texs := tm.compactScratch[:0]
+		rgbas, unlock := tm.realizedRGBAs.RLock()
+		if cap(texs) < len(rgbas) {
+			texs = make([]*texture, 0, len(rgbas))
+			tm.compactScratch = texs
+		}
+
+		// usedTextures only contains those textures that have their data2 set, which is only the case
+		// if it has or is loading an RGBA texture. No uninteresting textures make it into the map.
+		for tex := range rgbas {
+			texs = append(texs, tex)
+		}
+		unlock.RUnlock()
+		sort.Slice(texs, func(i, j int) bool {
+			return texs[i].lastUse < texs[j].lastUse
+		})
+		todo = min(todo, len(texs))
+		tm.unrealize(texs[:todo])
+		deletedRGBANum = todo
+	}
+
+	deletedCompressedNum := 0
+	if sizeCompressed > maxCompressedMemoryUsage {
+		remaining := int(sizeCompressed - maxCompressedMemoryUsage/2)
+		if debugTextureCompaction {
+			fmt.Println("Need to collect", float64(remaining)/1024/1024, "MiB compressed data")
+		}
+
+		at, unlock := tm.rgbas.RLock()
+		lookedAt := 0
+		remove := tm.compactScratch[:0]
+		at.Inorder(func(d comparableTimeDuration, tex *texture) bool {
+			if remaining <= 0 {
+				return false
+			}
+			lookedAt++
+			if !CanRecv(tex.computed.done) {
+				// The compressed data has already been deleted, and is either still gone, or in the
+				// process of being recomputed.
+				return true
+			}
+			sz := len(tex.computed.compressed)
+			remaining -= sz
+			deletedCompressedSize += sz
+			remove = append(remove, tex)
+			return true
+		})
+		unlock.RUnlock()
+
+		deletedCompressedNum = len(remove)
+		tm.uncompute(remove)
+		tm.compactScratch = remove[:0]
+	}
+
+	if active && debugTextureCompaction {
+		d := time.Since(t)
+		fmt.Println("--- After ---")
+		fmt.Println(&tm.Stats)
+		fmt.Printf("Compacted %d textures in %s\n", deletedRGBANum, d)
+		fmt.Printf("Deleted %d (%f MiB) compressed\n", deletedCompressedNum, float64(deletedCompressedSize)/1024/1024)
+	}
 }

@@ -201,14 +201,6 @@ type Canvas struct {
 	textures TextureManager
 }
 
-type costSortedTexture struct {
-	tex *texture
-}
-
-// func (t1 costSortedTexture) Compare(t2 costSortedTexture) int {
-// 	return stdcmp.Compare(t1.tex.computedIn.Load(), t2.tex.computedIn.Load())
-// }
-
 func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 	*cv = Canvas{
 		resizeMemoryTimelines: component.Resize{
@@ -608,6 +600,10 @@ func (cv *Canvas) scroll(gtx layout.Context, dx, dy float32) {
 
 func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	defer rtrace.StartRegion(context.Background(), "main.Canvas.Layout").End()
+
+	if win.Frame%compactInterval == 0 {
+		cv.textures.Compact()
+	}
 
 	// Compute the width. This has to make assumptions about the width of the timelines, because we need it
 	// long before we get to laying out the timelines. Practically, the max width of timelines is only restricted by

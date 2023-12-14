@@ -15,7 +15,6 @@ import (
 	"runtime/pprof"
 	rtrace "runtime/trace"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -462,109 +461,6 @@ type TimelinesComponent struct {
 }
 
 func (tlc *TimelinesComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
-	// XXX move all of this code into Canvas.Layout
-
-	// Every compactInterval we check the size of all textures and compressed data. If they exceed their
-	// limits, we delete the least frequently used textures and the cheapest to recompute compressed textures
-	// until we are under 50% of the respective limits again.
-	//
-	// Note that we don't ever collect uniforms, because it's hardly worth it. Even if we had a million
-	// uniforms, that would only account for 4 MB.
-	tm := &tlc.cv.textures
-	if win.Frame%compactInterval == 0 {
-		var (
-			numRGBAs       = tm.Stats.RealizedRGBAs.Load()
-			sizeRGBAs      = uint64(numRGBAs) * texWidth * 4
-			sizeCompressed = tm.Stats.CompressedSize.Load()
-
-			// The following variables are used for debug logging
-			t                     time.Time
-			deletedCompressedSize int
-			deletedRGBANum        int
-		)
-		active := sizeRGBAs > maxRGBAMemoryUsage || sizeCompressed > maxCompressedMemoryUsage
-		if active && debugTextureCompaction {
-			fmt.Println("--- Before ---")
-			fmt.Println(&tm.Stats)
-			t = time.Now()
-		}
-
-		if sizeRGBAs > maxRGBAMemoryUsage {
-			todo := int((sizeRGBAs - (maxRGBAMemoryUsage / 2)) / (texWidth * 4))
-			if debugTextureCompaction {
-				fmt.Println("Need to collect", todo, "textures")
-			}
-
-			texs := tlc.scratch[:0]
-			rgbas, unlock := tm.realizedRGBAs.RLock()
-			if cap(texs) < len(rgbas) {
-				texs = make([]*texture, 0, len(rgbas))
-				tlc.scratch = texs
-			}
-
-			// usedTextures only contains those textures that have their data2 set, which is only the case
-			// if it has or is loading an RGBA texture. No uninteresting textures make it into the map.
-			for tex := range rgbas {
-				texs = append(texs, tex)
-			}
-			unlock.RUnlock()
-			sort.Slice(texs, func(i, j int) bool {
-				return texs[i].lastUse < texs[j].lastUse
-			})
-			todo = min(todo, len(texs))
-			tm.unrealize(texs[:todo])
-			deletedRGBANum = todo
-		}
-
-		deletedCompressedNum := 0
-		if sizeCompressed > maxCompressedMemoryUsage {
-			remaining := int(sizeCompressed - maxCompressedMemoryUsage/2)
-			if debugTextureCompaction {
-				fmt.Println("Need to collect", float64(remaining)/1024/1024, "MiB compressed data")
-			}
-
-			at, unlock := tm.rgbas.RLock()
-			lookedAt := 0
-			remove := tlc.scratch[:0]
-			at.Inorder(func(d comparableTimeDuration, tex *texture) bool {
-				if remaining <= 0 {
-					return false
-				}
-				lookedAt++
-				if !CanRecv(tex.computed.done) {
-					// The compressed data has already been deleted, and is either still gone, or in the
-					// process of being recomputed.
-					return true
-				}
-				sz := len(tex.computed.compressed)
-				remaining -= sz
-				deletedCompressedSize += sz
-				remove = append(remove, tex)
-				return true
-			})
-			unlock.RUnlock()
-
-			deletedCompressedNum = len(remove)
-			tm.uncompute(remove)
-			tlc.scratch = remove[:0]
-		}
-
-		if active && debugTextureCompaction {
-			d := time.Since(t)
-			fmt.Println("--- After ---")
-			fmt.Println(&tm.Stats)
-			fmt.Printf("Compacted %d textures in %s\n", deletedRGBANum, d)
-			fmt.Printf("Deleted %d (%f MiB) compressed\n", deletedCompressedNum, float64(deletedCompressedSize)/1024/1024)
-		}
-	}
-
-	// +1 to avoid firing on the same frame as compaction
-	if debugTextureCompaction && ((win.Frame+1)%compactInterval)*10 == 0 {
-		// Regularly print memory statistics
-		fmt.Println("--- Stats ---")
-		fmt.Println(&tlc.cv.textures.Stats)
-	}
-
 	return tlc.cv.Layout(win, gtx)
 }
 
@@ -765,10 +661,6 @@ func (mwin *MainWindow) renderMainScene(win *theme.Window, gtx layout.Context) l
 
 	for _, s := range win.PressedShortcuts() {
 		switch s {
-		case theme.Shortcut{Name: "D"}:
-			debugNewTexture = !debugNewTexture
-			fmt.Println(debugNewTexture)
-
 		case theme.Shortcut{Name: "G"}:
 			pl := &theme.CommandPalette{Prompt: "Scroll to timeline"}
 			pl.Set(ScrollToTimelineCommandProvider{mwin.twin, mwin.canvas.timelines})

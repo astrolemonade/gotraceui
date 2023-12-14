@@ -637,8 +637,6 @@ func (it *renderedSpansIterator) next(gtx layout.Context) (spansOut Items[ptrace
 	return it.spans.Slice(startOffset, offset), startPx, endPx, true
 }
 
-var debugNewTexture = false
-
 func (track *Track) Layout(
 	win *theme.Window,
 	gtx layout.Context,
@@ -801,12 +799,18 @@ func (track *Track) Layout(
 		highlighted := false
 		isPlaceholder := dspSpans.Len() != 0 && dspSpans.At(0).State == statePlaceholder
 		if hovered {
-			// XXX if hovering a "merged" span then we can't just draw a rectangle for the highlight, because no span
-			// will be drawn on top of the border.
 			highlightedPrimaryOutlinesPath.MoveTo(minP)
 			highlightedPrimaryOutlinesPath.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
 			highlightedPrimaryOutlinesPath.LineTo(maxP)
 			highlightedPrimaryOutlinesPath.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
+			highlightedPrimaryOutlinesPath.Close()
+
+			// Cut a hole
+			off := float32(spanHighlightedBorderWidth)
+			highlightedPrimaryOutlinesPath.MoveTo(minP.Add(f32.Pt(off, off)))
+			highlightedPrimaryOutlinesPath.LineTo(f32.Point{X: minP.X + off, Y: maxP.Y - off})
+			highlightedPrimaryOutlinesPath.LineTo(maxP.Add(f32.Pt(-off, -off)))
+			highlightedPrimaryOutlinesPath.LineTo(f32.Point{X: maxP.X - off, Y: minP.Y + off})
 			highlightedPrimaryOutlinesPath.Close()
 		} else if highlighted {
 			highlightedSecondaryOutlinesPath.MoveTo(minP)
@@ -814,13 +818,28 @@ func (track *Track) Layout(
 			highlightedSecondaryOutlinesPath.LineTo(maxP)
 			highlightedSecondaryOutlinesPath.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
 			highlightedSecondaryOutlinesPath.Close()
+
+			// Cut a hole
+			off := float32(spanHighlightedBorderWidth)
+			highlightedSecondaryOutlinesPath.MoveTo(minP.Add(f32.Pt(off, off)))
+			highlightedSecondaryOutlinesPath.LineTo(f32.Point{X: minP.X + off, Y: maxP.Y - off})
+			highlightedSecondaryOutlinesPath.LineTo(maxP.Add(f32.Pt(-off, -off)))
+			highlightedSecondaryOutlinesPath.LineTo(f32.Point{X: maxP.X - off, Y: minP.Y + off})
+			highlightedSecondaryOutlinesPath.Close()
 		} else {
-			if dspSpans.Len() == 1 && dspSpans.At(0).State != statePlaceholder && (endPx-startPx) > float32(gtx.Dp(minSpanWidthDp)) {
-				// Draw outline as a rectangle, the span will draw on top of it so that only the outline remains.
+			if dspSpans.Len() != 0 && dspSpans.At(0).State != statePlaceholder && (endPx-startPx) > float32(gtx.Dp(minSpanWidthDp)) {
 				outlinesPath.MoveTo(minP)
 				outlinesPath.LineTo(f32.Point{X: maxP.X, Y: minP.Y})
 				outlinesPath.LineTo(maxP)
 				outlinesPath.LineTo(f32.Point{X: minP.X, Y: maxP.Y})
+				outlinesPath.Close()
+
+				// Cut a hole
+				off := float32(spanBorderWidth)
+				outlinesPath.MoveTo(minP.Add(f32.Pt(off, off)))
+				outlinesPath.LineTo(f32.Point{X: minP.X + off, Y: maxP.Y - off})
+				outlinesPath.LineTo(maxP.Add(f32.Pt(-off, -off)))
+				outlinesPath.LineTo(f32.Point{X: maxP.X - off, Y: minP.Y + off})
 				outlinesPath.Close()
 			}
 		}
@@ -996,14 +1015,12 @@ func (track *Track) Layout(
 	}
 
 	allDspSpans := track.widget.prevFrame.dspSpans[:0]
-	if !debugNewTexture {
-		// OPT(dh): reuse slice between frames
-		var texs []TextureStack
-		texs = track.rnd.Render(win, track, spans, cv.nsPerPx, cv.start, cv.End(), texs)
-		for _, tex := range texs {
-			if !tex.Add(win, &cv.textures, tr, gtx.Ops) {
-				track.widget.lowQualityRender = true
-			}
+	// OPT(dh): reuse slice between frames
+	var texs []TextureStack
+	texs = track.rnd.Render(win, track, spans, cv.nsPerPx, cv.start, cv.End(), texs)
+	for _, tex := range texs {
+		if !tex.Add(win, gtx, &cv.textures, tr, gtx.Ops) {
+			track.widget.lowQualityRender = true
 		}
 	}
 
